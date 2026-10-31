@@ -1,0 +1,16 @@
+# Build output from Cargo.
+/target
+
+# Cargo.lock is committed on purpose: this package has a binary target,
+# and a lock file makes builds reproducible.
+
+# Large experiment data files (keep the folder itself through data/.gitkeep).
+/data/*
+!/data/.gitkeep
+
+# Editor and operating system files.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+[package]
+name = "rust_rope"
+version = "0.1.0"
+edition = "2024"
+description = "An educational, from-scratch implementation of Rotary Position Embeddings (RoPE) in Rust."
+publish = false
+
+# Library crate: src/lib.rs (detected automatically).
+# Binary crate:  src/main.rs (detected automatically).
+
+[dependencies]
+# Intentionally empty. Stage 1 uses only the Rust standard library.
+# Rule: every new dependency must be explained in explain.md first.
+
+[dev-dependencies]
+# Intentionally empty. A benchmark framework may be added in Stage 6.
+
+[[bench]]
+name = "rope_benchmark"
+# `harness = false` tells Cargo not to use the built-in (nightly-only) test
+# harness for this benchmark. The file supplies its own `main` function.
+harness = false
