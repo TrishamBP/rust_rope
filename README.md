@@ -3,8 +3,10 @@
 An educational, from-scratch implementation of **Rotary Position Embeddings
 (RoPE)** in Rust.
 
-> **Status:** Stage 1 — project foundation. The module structure exists.
-> No RoPE algorithm is implemented yet.
+> **Status:** Stage 2 complete — mathematical foundations. The `math`
+> module (vectors, complex numbers, trigonometry, 2 × 2 rotation matrices,
+> Euler's formula) is implemented and tested. No RoPE algorithm is
+> implemented yet (Stage 3 is next).
 
 ---
 
@@ -83,18 +85,20 @@ attention sees relative positions. RoPE adds no trainable parameters.
 
 Legend: ✅ done · 🔄 in progress · ⏳ planned
 
-### Stage 1: Project foundation — 🔄
+### Stage 1: Project foundation — ✅
 - Rust project initialization. ✅
 - Module structure. ✅
 - Rust development conventions. ✅
 - Documentation setup. ✅
 
-### Stage 2: Mathematical foundations — ⏳
-- Vectors and matrices.
-- Complex numbers.
-- Trigonometric functions.
-- Two-dimensional rotations.
-- Rotation matrices.
+### Stage 2: Mathematical foundations — ✅
+- Vectors and matrices. ✅ `math::matrix::{Vector, Matrix2}`
+- Complex numbers. ✅ `math::complex::Complex`
+- Trigonometric functions. ✅ `math::trigonometry`
+- Two-dimensional rotations. ✅ `rotate_vector`, `Complex::rotate`
+- Rotation matrices. ✅ `Matrix2::rotation`
+- Euler's formula. ✅ `Complex::from_polar`
+- Shared float comparison. ✅ `math::approx_eq`
 
 ### Stage 3: RoPE fundamentals — ⏳
 - Positional frequencies.
@@ -148,7 +152,8 @@ cargo check --all-targets      # Type-check all code without a full build
 cargo build                    # Build the library and the binary
 cargo run                      # Run the demonstration binary (src/main.rs)
 cargo test                     # Run unit tests and integration tests
-cargo run --example basic_rope # Run the example
+cargo run --example math_foundations # Print the Stage 2 numerical examples
+cargo run --example basic_rope # Run the RoPE example (placeholder)
 cargo bench                    # Run the benchmarks (optimized build)
 cargo fmt                      # Format the code
 cargo clippy --all-targets     # Run the linter

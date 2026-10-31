@@ -6,5 +6,5 @@
 //! vector and a small key vector and print the result.
 
 fn main() {
-    println!("basic_rope example: placeholder. RoPE is not implemented yet (Stage 1).");
+    println!("basic_rope example: placeholder. RoPE is not implemented yet (planned for Stage 4).");
 }

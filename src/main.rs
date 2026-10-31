@@ -6,9 +6,10 @@
 fn main() {
     // `env!` reads a value at compile time. Cargo sets these variables.
     println!(
-        "{} v{} — Stage 1: project foundation.",
+        "{} v{} — Stage 2: mathematical foundations complete.",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
     println!("No RoPE algorithms are implemented yet. See README.md for the roadmap.");
+    println!("Run `cargo run --example math_foundations` to see the Stage 2 mathematics.");
 }

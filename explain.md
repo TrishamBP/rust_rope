@@ -18,6 +18,11 @@ Each implementation milestone adds one new entry.
 | Entry | Date | Stage | Topic |
 |---|---|---|---|
 | 1 | 2026-10-31 | Stage 1 | Project foundation: structure, documentation, conventions |
+| 2 | 2026-10-31 | Stage 2 | Vector operations (`Vector`, dot product, magnitude, `approx_eq`) |
+| 3 | 2026-10-31 | Stage 2 | Complex numbers (`Complex`, operator traits, conjugate, phase) |
+| 4 | 2026-10-31 | Stage 2 | Trigonometry (radians, unit circle, periodicity, precision) |
+| 5 | 2026-10-31 | Stage 2 | 2 × 2 matrices and rotation matrices (`Matrix2`, `R(θ)`) |
+| 6 | 2026-10-31 | Stage 2 | Euler's formula and rotation by complex multiplication |
 
 ---
 
@@ -466,3 +471,2803 @@ Legend: ✅ done · 🔄 in progress · ⏳ planned
 `src/math/`. We derive the 2-D rotation matrix, prove that it keeps vector
 length, connect it to complex multiplication, and implement each primitive
 with tests.
+
+
+---
+
+# Entry 2 — Vector operations (Stage 2, Component 1)
+
+**Date:** 2026-10-31
+**Stage:** 2 (Mathematical foundations)
+**Files:** `src/math/matrix.rs` (the `Vector` part), `src/math/mod.rs`
+(`approx_eq`)
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `Vector` struct with `new`, `from_slice`, `dimension`, `is_empty`, `components`, `into_components` | ✅ Implemented |
+| `checked_add`, `checked_sub`, `dot`, `magnitude` | ✅ Implemented |
+| `DimensionMismatch` error type | ✅ Implemented |
+| `approx_eq` and `DEFAULT_TOLERANCE` (shared float comparison) | ✅ Implemented |
+| Scalar multiplication, normalization | ⏳ Not needed yet. Not implemented. |
+| Overflow-safe magnitude | ⏳ Discussed in section 8. Not implemented. |
+
+---
+
+## 1. What did we build?
+
+We built a type `Vector`. It represents a list of `n` real numbers. With it,
+we can:
+
+- create a vector from a list of numbers,
+- read its dimension `n`,
+- add and subtract two vectors,
+- calculate the dot product of two vectors,
+- calculate the length (magnitude) of a vector.
+
+If two vectors have different dimensions, addition, subtraction and the dot
+product return an error of type `DimensionMismatch`.
+
+We also built `approx_eq`. It compares two floating-point numbers with a
+tolerance. All tests in the project use it.
+
+## 2. Why did we build it?
+
+In a Transformer, every token is a vector. The vectors that RoPE changes are
+the **query** vector `q` and the **key** vector `k`. Attention compares them
+with the dot product `q · k`. A large dot product means "this key is
+relevant to this query".
+
+RoPE rotates `q` and `k` before the dot product. Thus, to understand RoPE,
+we must first understand:
+
+- what a vector is,
+- what the dot product measures,
+- what the length of a vector is (because a rotation does not change it).
+
+## 3. Mathematical foundation
+
+### 3.1 What is a vector?
+
+A **vector** is an ordered list of numbers:
+
+```text
+v = [v₁, v₂, ..., vₙ]
+```
+
+- `v` is the name of the vector.
+- `vᵢ` (read "v sub i") is the component at position `i`. The small number
+  below the letter is the **index**.
+- `n` is the **dimension**: the number of components.
+
+**Example.** `v = [3, 4]` has dimension `n = 2`. `v₁ = 3` and `v₂ = 4`.
+
+**Geometric interpretation.** In two dimensions, `[3, 4]` is an arrow. It
+starts at the origin `(0, 0)`. It ends at the point `(3, 4)`. In higher
+dimensions we cannot draw the arrow, but the same rules apply.
+
+**Note on indices.** Mathematics usually counts from 1 (`v₁` is first).
+Rust counts from 0 (`v[0]` is first). Thus, `vᵢ` in an equation is
+`v[i - 1]` in Rust. In later stages, we write equations with indices that
+start at 0, to match the code.
+
+### 3.2 Addition and subtraction
+
+We add two vectors component by component:
+
+```text
+a + b = [a₁ + b₁, a₂ + b₂, ..., aₙ + bₙ]
+a − b = [a₁ − b₁, a₂ − b₂, ..., aₙ − bₙ]
+```
+
+This definition needs **the same dimension `n`** for `a` and `b`. If `a` has
+3 components and `b` has 2, the third sum `a₃ + b₃` does not exist. For this
+reason, the operation is **not defined**, and our code returns an error.
+
+**Geometric interpretation.** To calculate `a + b`, put the start of arrow
+`b` at the end of arrow `a`. The sum goes from the start of `a` to the end
+of `b`. The difference `a − b` is the arrow from the end of `b` to the end
+of `a`.
+
+**Numerical example.**
+
+```text
+a = [1, 2, 3],  b = [4, −5, −3]
+a + b = [1 + 4, 2 + (−5), 3 + (−3)] = [5, −3, 0]
+```
+
+### 3.3 The dot product
+
+The **dot product** of `a` and `b` is one number:
+
+```text
+a · b = Σᵢ aᵢ·bᵢ = a₁·b₁ + a₂·b₂ + ... + aₙ·bₙ
+```
+
+The symbol `Σ` (the Greek capital letter "sigma") means "sum". `Σᵢ` means
+"calculate the expression for each index `i`, and add the results".
+
+**Numerical example.**
+
+```text
+a = [1, 2, 3],  b = [4, 5, 6]
+a · b = 1·4 + 2·5 + 3·6 = 4 + 10 + 18 = 32
+```
+
+**Geometric meaning.** The dot product also has this form:
+
+```text
+a · b = ‖a‖ · ‖b‖ · cos(α)
+```
+
+- `‖a‖` is the length of `a` (section 3.4).
+- `α` (the Greek letter "alpha") is the angle between the two arrows.
+
+**Derivation of the geometric form (two dimensions).** Write each vector
+with its length and its direction angle. Let `a` have length `r` and angle
+`φ`. Let `b` have length `s` and angle `ψ`. On the unit circle (Entry 4), a
+direction with angle `φ` is the point `(cos(φ), sin(φ))`. Thus:
+
+```text
+a = [r·cos(φ), r·sin(φ)],   b = [s·cos(ψ), s·sin(ψ)]
+a · b = r·s·(cos(φ)·cos(ψ) + sin(φ)·sin(ψ))
+```
+
+The angle-difference identity is
+`cos(ψ − φ) = cos(ψ)·cos(φ) + sin(ψ)·sin(φ)`. Thus:
+
+```text
+a · b = r·s·cos(ψ − φ)
+```
+
+The angle between the arrows is `α = ψ − φ`. This proves the formula in
+two dimensions. The same result is true in all dimensions.
+
+**What this tells us:**
+
+| Angle `α` | `cos(α)` | Dot product | Meaning |
+|---|---|---|---|
+| 0° | 1 | largest positive value | same direction |
+| 90° | 0 | 0 | perpendicular ("orthogonal") |
+| 180° | −1 | largest negative value | opposite directions |
+
+**Example.** `[1, 0] · [0, 1] = 1·0 + 0·1 = 0`. The x-axis and the y-axis
+are perpendicular.
+
+**Why this is important for RoPE.** Attention uses `q · k`. The dot product
+depends on the lengths **and the angle** between `q` and `k`. RoPE changes
+only the angle, by rotation. Thus, RoPE changes the attention score in a
+controlled way. Entry 5 and Stage 3 show this in detail.
+
+### 3.4 The magnitude (Euclidean norm)
+
+The **magnitude** (also: length, Euclidean norm) of `v` is:
+
+```text
+‖v‖ = √(Σᵢ vᵢ²) = √(v₁² + v₂² + ... + vₙ²)
+```
+
+The double bars `‖ ‖` mean "length of". `√` is the square root.
+
+**Derivation (two dimensions).** The vector `[x, y]` is the hypotenuse
+(the longest side) of a right triangle. The other two sides have the
+lengths `x` and `y`. The theorem of Pythagoras says:
+
+```text
+length² = x² + y²   →   length = √(x² + y²)
+```
+
+In three dimensions, apply the theorem two times. First, the diagonal of
+the floor is `√(x² + y²)`. Then this diagonal and the height `z` make a new
+right triangle:
+
+```text
+length = √( (√(x² + y²))² + z² ) = √(x² + y² + z²)
+```
+
+Each new dimension adds one more square under the root.
+
+**Link to the dot product.** `v · v = Σᵢ vᵢ·vᵢ = Σᵢ vᵢ² = ‖v‖²`.
+Thus, `‖v‖ = √(v · v)`. Our test
+`dot_product_with_itself_is_magnitude_squared` checks this identity.
+
+**Numerical example.** `‖[3, 4]‖ = √(9 + 16) = √25 = 5`.
+`‖[−3, −4]‖ = 5` too: squares remove the signs.
+
+### 3.5 Floating-point precision
+
+A computer stores a real number as an **`f64`**: a 64-bit binary
+floating-point number (IEEE 754 "double precision"). It has 53 binary
+digits of precision. This is about 15 to 17 decimal digits.
+
+Many decimal numbers have no exact binary form. Example: `0.1` in binary is
+`0.000110011001100...` with no end. The computer rounds it. Thus:
+
+```text
+0.1 + 0.2 = 0.30000000000000004   (in f64)
+```
+
+Our test `floating_point_addition_needs_a_tolerance` shows this.
+
+**Consequence:** do not compare calculated floating-point values with `==`.
+Compare them with a tolerance. Section 6.2 explains our `approx_eq` helper.
+
+**Where exact comparison is correct.** Some results are exact in binary.
+Small integers have an exact `f64` form. IEEE 754 requires that `+`, `−`,
+`×`, `÷` and `√` give the correctly rounded result. Thus `3² + 4² = 25`
+exactly, `√25 = 5` exactly, and the test for `‖[3, 4]‖` correctly uses `==`.
+
+## 4. Rust concepts learned
+
+### 4.1 Structs
+
+A **struct** groups named values (fields) into one new type.
+
+```rust
+pub struct Vector {
+    components: Vec<f64>,
+}
+```
+
+The field `components` has no `pub`. Thus, it is **private**. Code outside
+the `matrix` module cannot read it or change it directly. It must use the
+methods.
+
+**Why a private field?** A wrapper type with one private field is a
+**newtype**. It lets us control all operations. Later, we can change the
+internal storage without breaking the code that uses `Vector`.
+
+Small independent example:
+
+```rust
+mod bank {
+    pub struct Account { balance: i64 }      // private field
+    impl Account {
+        pub fn new() -> Self { Account { balance: 0 } }
+        pub fn balance(&self) -> i64 { self.balance }
+    }
+}
+// let a = bank::Account { balance: 100 }; // Error: the field is private
+let a = bank::Account::new();               // OK
+```
+
+### 4.2 `Vec<f64>`
+
+`Vec<T>` is the standard growable array. `Vec<f64>` holds `f64` values.
+
+A `Vec` has two parts:
+
+1. **On the stack:** three machine words. On a 64-bit computer this is
+   3 × 8 = 24 bytes: a pointer to the data, the **capacity** (the number of
+   slots allocated) and the **length** (the number of slots in use).
+2. **On the heap:** the data itself: `capacity × 8` bytes, one after the
+   other ("contiguous").
+
+```text
+ Stack (Vector)                Heap
+┌──────────────┐          ┌─────┬─────┬─────┐
+│ ptr      ────┼────────► │ 1.0 │ 2.0 │ 3.0 │
+│ capacity = 3 │          └─────┴─────┴─────┘
+│ length   = 3 │             8 B   8 B   8 B
+└──────────────┘
+```
+
+`Vector` has only one field. Thus, `Vector` has exactly the same size as
+`Vec<f64>`: 24 bytes. The wrapper costs nothing.
+
+**Why `f64` and not `f32`?** `f64` has about 16 decimal digits. `f32` has
+about 7. In Stage 2 we learn the mathematics, and we want small errors.
+Real models often use `f32` or smaller types for speed. We study this in
+Stage 6.
+
+### 4.3 Associated functions and methods
+
+Code in an `impl Vector { ... }` block belongs to the type.
+
+- An **associated function** has no `self` parameter. You call it with
+  `Type::name(...)`. Constructors are associated functions:
+  `Vector::new(vec![1.0])`.
+- A **method** has a `self` parameter. You call it with `value.name(...)`:
+  `v.magnitude()`.
+
+The form of `self` decides the ownership:
+
+| Parameter | Meaning | Example in our code |
+|---|---|---|
+| `&self` | borrow, read only | `dimension`, `dot`, `magnitude` |
+| `&mut self` | borrow, read and change | not used yet |
+| `self` | take ownership (move) | `into_components` |
+
+`Self` (capital S) is an alias for the type of the `impl` block. Here,
+`Self` means `Vector`.
+
+### 4.4 Ownership, moves and borrows
+
+**Ownership rules:**
+
+1. Each value has one owner.
+2. When the owner goes out of scope, Rust drops the value (frees its memory).
+3. Assignment or a function call **moves** the value, unless the type is
+   `Copy` (Entry 3) or you pass a reference.
+
+**`new` moves:**
+
+```rust
+let data = vec![1.0, 2.0];
+let v = Vector::new(data);     // `data` moves into `v`
+// println!("{:?}", data);     // Error: value used after move
+```
+
+The move copies only the 24 stack bytes (pointer, capacity, length). The
+heap data stays where it is. No allocation occurs. A move is cheap.
+
+**`from_slice` borrows:**
+
+```rust
+let data = [1.0, 2.0];
+let v = Vector::from_slice(&data);   // `&data` is a borrow
+println!("{:?}", data);              // OK: we still own `data`
+```
+
+`&[f64]` is a **slice**: a reference to a sequence of `f64` values. It has
+two words: a pointer and a length. `values.to_vec()` allocates a new heap
+buffer and copies the values. The caller keeps the original.
+
+**`checked_add` borrows both operands:**
+
+```rust
+pub fn checked_add(&self, other: &Vector) -> Result<Vector, DimensionMismatch>
+```
+
+Both inputs are references. Thus, the caller can use `a` and `b` again
+after `a.checked_add(&b)`. The result is a new `Vector` that the caller
+owns.
+
+**`into_components` moves `self`:**
+
+```rust
+let v = Vector::new(vec![7.0, 8.0]);
+let raw: Vec<f64> = v.into_components();  // `v` is consumed
+// v.dimension();                          // Error: `v` was moved
+```
+
+In Rust, the name prefix `into_` means "consume `self` and convert it".
+
+**Mutable references (`&mut`).** A mutable reference allows a change. Rust
+permits **either** one `&mut` reference **or** any number of `&` references
+at the same time, never both. This rule prevents data races and the use of
+invalid pointers. We do not need `&mut` yet, because all Component 1
+operations return new values. Stage 4 uses `&mut [f64]` to rotate
+embeddings in place.
+
+Small independent example:
+
+```rust
+let mut v = vec![1.0, 2.0];
+let r = &mut v;
+r.push(3.0);            // OK: a change through the mutable reference
+// let s = &v;          // Error if `r` is used after this line
+println!("{:?}", v);    // OK: `r` is no longer used
+```
+
+### 4.5 Iterators
+
+`magnitude` uses an **iterator chain**:
+
+```rust
+self.components.iter().map(|x| x * x).sum::<f64>().sqrt()
+```
+
+Step by step:
+
+1. `.iter()` creates an iterator. It yields `&f64` (a reference to each
+   component). It does not copy the vector.
+2. `.map(|x| x * x)` applies a **closure** (an anonymous function) to each
+   element. `|x| x * x` takes `x` and returns `x * x`. The standard library
+   implements `&f64 * &f64`, so this works with references.
+3. `.sum::<f64>()` adds all values. `::<f64>` (the "turbofish") tells the
+   compiler the type of the result. Without it, the compiler cannot select
+   the type for `.sqrt()`.
+4. `.sqrt()` calculates the square root.
+
+`dot` and `checked_add` use `.zip(...)`. `zip` combines two iterators into
+one iterator of pairs `(aᵢ, bᵢ)`. This is a direct translation of
+`Σᵢ aᵢ·bᵢ`.
+
+`checked_add` ends with `.collect()`. `collect` puts the iterator results
+into a collection. The compiler finds the collection type from the field
+type: `components` is `Vec<f64>`, so `collect` creates a `Vec<f64>`.
+
+**Iterators are lazy.** `map` and `zip` do not calculate anything when you
+call them. The calculation happens when `sum` or `collect` consumes the
+iterator. The compiler then usually converts the chain into one simple
+loop. This is a **zero-cost abstraction**.
+
+**Why not an index loop?** In a loop `for i in 0..n { a[i] + b[i] }`, each
+`a[i]` has a bounds check (it panics if `i` is too large). The `zip` version
+cannot go out of bounds, so the compiler does not need bounds checks.
+
+### 4.6 Error handling with `Result`
+
+`Result<T, E>` is an `enum` with two variants:
+
+```rust
+enum Result<T, E> {
+    Ok(T),   // success, contains the value
+    Err(E),  // failure, contains the error
+}
+```
+
+`dot` returns `Result<f64, DimensionMismatch>`. The caller must handle both
+cases. The compiler shows a warning if the caller ignores a `Result`.
+
+**The `?` operator.** In `checked_add`:
+
+```rust
+self.check_same_dimension(other)?;
+```
+
+If the result is `Err(e)`, `?` returns `Err(e)` from `checked_add`
+immediately. If the result is `Ok(())`, execution continues. `()` (the
+"unit" type) means "no value".
+
+**Why `Result` and not `panic!`?** A dimension mismatch is an error that
+the **caller** causes. The caller can correct it. `panic!` stops the
+thread. It is for bugs in our own code. `CLAUDE.md` section 6 states this
+rule.
+
+**The error type.** `DimensionMismatch` contains the two dimensions. Thus,
+the error message can tell the user exactly what is wrong. It implements:
+
+- `Debug` (with `#[derive]`): print with `{:?}`. `assert_eq!` needs it.
+- `Display` (by hand): a readable message with `{}` or `.to_string()`.
+- `std::error::Error`: the standard error trait. Other error-handling code
+  can accept our error.
+- `Copy`, `Clone`, `PartialEq`, `Eq`: the error is two `usize` values.
+  It is cheap to copy and easy to compare in tests.
+
+### 4.7 `#[derive]`
+
+`#[derive(Debug, Clone, PartialEq)]` tells the compiler to generate trait
+implementations automatically.
+
+- `Debug`: print the struct for debugging.
+- `Clone`: `v.clone()` makes a **deep copy**: a new heap buffer with the
+  same values.
+- `PartialEq`: `a == b` compares all components.
+
+`Vector` is **not** `Copy`. A `Copy` type must be copyable bit by bit. A
+bitwise copy of a `Vec` would create two owners of the same heap buffer.
+Both would free it, and the program would free the memory two times. Rust
+forbids `Copy` for types that own heap memory.
+
+### 4.8 Unit tests and `#[cfg(test)]`
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn name() { /* ... */ }
+}
+```
+
+- `#[cfg(test)]` compiles this module **only** for `cargo test`. The test
+  code is not in the normal build.
+- `use super::*;` imports all items of the parent module, also the private
+  items. Thus, unit tests can test private functions.
+- `#[test]` marks a test function.
+
+## 5. Memory and execution
+
+**Example call:** `let s = a.checked_add(&b)?;` with `a = [1, 2, 3]` and
+`b = [4, 5, 6]`.
+
+1. `a` and `b` each are 24 bytes on the stack. Each points to 24 bytes of
+   heap data.
+2. The call passes `&a` (as `self`) and `&b`. Each reference is 8 bytes.
+   No vector data is copied.
+3. `check_same_dimension` reads the two lengths. Both are 3. It returns
+   `Ok(())`. No allocation occurs.
+4. `iter().zip().map()` creates a small iterator struct **on the stack**.
+5. `collect()` allocates **one** heap buffer. The iterator knows its exact
+   length (3), so `collect` allocates the correct capacity one time.
+6. The new `Vec` moves into a new `Vector`, then into `Ok(...)`, then to the
+   caller. Each step is a move of 24 bytes. The heap buffer does not move.
+7. `a` and `b` are still valid. When the caller's scope ends, Rust drops
+   `s`, `b` and `a` in the reverse order of declaration. Each drop frees one
+   heap buffer.
+
+**Memory summary of each operation:**
+
+| Operation | Heap allocations | Ownership |
+|---|---|---|
+| `Vector::new(vec)` | 0 (reuses the `Vec` buffer) | moves the `Vec` in |
+| `Vector::from_slice(&s)` | 1 | borrows `s`, copies |
+| `dimension`, `components` | 0 | borrows |
+| `checked_add`, `checked_sub` | 1 (the result) | borrows both |
+| `dot`, `magnitude` | 0 | borrows |
+| `into_components` | 0 | moves `self` out |
+| `clone` | 1 | borrows, deep copy |
+
+## 6. Engineering decisions
+
+### 6.1 Named methods `checked_add` and `checked_sub`, not the `+` operator
+
+We could implement the `Add` trait so that `&a + &b` works. But `Add::add`
+must return one output type. There are two choices:
+
+- Return `Vector` and **panic** on a dimension mismatch. This breaks our
+  error rule.
+- Return `Result<Vector, _>`. Then `&a + &b` has the type `Result`, and
+  `(&a + &b) + &c` does not compile. This is surprising for an operator.
+
+Thus, we use named methods. The prefix `checked_` follows the standard
+library convention: `i32::checked_add` returns `None` on overflow instead
+of a panic. Complex numbers (Entry 3) cannot fail, so they use real
+operators.
+
+### 6.2 A shared `approx_eq` helper in `src/math/mod.rs`
+
+Many tests compare floating-point values. One shared helper:
+
+- gives all tests the same, documented rule,
+- is public, so the integration tests in `tests/` can use it too.
+
+We put it in `math`, because it is a general numerical tool, and `math`
+must not depend on other modules.
+
+The rule:
+
+```text
+|a − b| ≤ tolerance × max(1, |a|, |b|)
+```
+
+- **Absolute** near zero. This is necessary, because `cos(π/2)` in `f64` is
+  `6.1e-17`, not `0`. A pure relative test against 0 would never pass.
+- **Relative** for large values, because floating-point errors grow with
+  the size of the values.
+
+**A bug that the tests found.** The first version returned `true` for
+`approx_eq(+∞, −∞, …)`. The reason: `|+∞ − (−∞)| = ∞` and `scale = ∞`, so
+the test was `∞ ≤ ∞`, which is true. We added an explicit check: two
+infinities that are not exactly equal are different, and an infinity is
+different from every finite number. The test `special_values` now covers
+these cases. This shows why we test edge cases.
+
+**Why `1e-12`?** See the comment on `DEFAULT_TOLERANCE`. In short: it is
+about 4500 × `f64::EPSILON`. Rounding errors of short calculations are
+smaller. Real mistakes are much larger.
+
+### 6.3 A struct with a private field, not a bare `Vec<f64>`
+
+A bare `Vec<f64>` would work. But then any code could push values and
+change the dimension. The `Vector` type names the concept, keeps its
+methods together, and costs zero extra bytes.
+
+### 6.4 `DimensionMismatch` is in `matrix.rs`
+
+The error belongs to the vector operations. `utils/validation.rs` is for
+RoPE configuration validation (Stage 3). If we put the error there, `math`
+would depend on `utils`. We prefer that `math` stays independent.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage | Decision |
+|---|---|---|---|
+| Fixed-size array `[f64; N]` with const generics (`Vector<const N: usize>`) | No heap. The compiler checks the dimensions, so no runtime error | `N` must be known at compile time. RoPE reads `d` from a configuration | Not for general vectors. We use `[f64; 2]` for 2-D (Entry 5) |
+| Free functions on slices `&[f64]` | No wrapper type. Works with any data | No type for the concept. Dimension rules are spread out | Possible in Stage 4 for in-place work |
+| `Add` trait with panic | Short syntax `&a + &b` | Panics on caller errors | Rejected |
+| External crate (`ndarray`, `nalgebra`) | Complete and fast | Hides the concepts we want to learn. Adds a dependency | Rejected (project rule) |
+| Generic over `f32`/`f64` (`Vector<T>`) | One code for both types | Needs a numeric trait (not in the standard library) or much extra code | Not yet. Maybe Stage 6 |
+
+## 8. Performance considerations
+
+**Complexity.** For dimension `n`:
+
+| Operation | Time | Extra memory |
+|---|---|---|
+| `dimension` | O(1) | 0 |
+| `checked_add`, `checked_sub` | O(n) | n × 8 bytes (the result) |
+| `dot`, `magnitude` | O(n) | 0 |
+
+"O(n)" means: the time grows in proportion to `n`. "O(1)" means: the time
+does not depend on `n`.
+
+**Cache locality.** The components are contiguous in memory. The processor
+reads memory in blocks of 64 bytes ("cache lines"). One block contains 8
+`f64` values. A sequential pass is the fastest memory access pattern.
+
+**SIMD.** SIMD (Single Instruction, Multiple Data) processes several numbers
+with one instruction. The compiler can automatically use SIMD for
+`checked_add`. For `dot` and `magnitude`, it usually **cannot**. The reason:
+the sum must add the values in the exact order of the source code, because
+floating-point addition is not associative. `(a + b) + c` can be different
+from `a + (b + c)`. Stage 6 studies this.
+
+**Overflow.** `magnitude` squares each component. If a component is larger
+than about `1.34e154`, its square is larger than `f64::MAX ≈ 1.8e308` and
+becomes infinity. The test `magnitude_overflows_for_very_large_components`
+documents this. A safe method first divides by the largest absolute
+component, then multiplies the result back. It is slower. Embedding values
+are usually smaller than 100, so we use the simple formula. For 2-D, the
+standard library has `f64::hypot`, which is overflow-safe. Entry 3 uses it.
+
+**Allocation.** `checked_add` allocates for each result. In a loop with
+many additions, this is slow. A later version can add an in-place method
+(`&mut self`) if a real need exists.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::matrix::Vector;
+
+let a = Vector::new(vec![1.0, 2.0, 3.0]);
+let b = Vector::new(vec![4.0, 5.0, 6.0]);
+
+println!("{:?}", a.checked_add(&b).unwrap().components());
+println!("{:?}", a.checked_sub(&b).unwrap().components());
+println!("{:?}", a.dot(&b));
+println!("{}", Vector::new(vec![3.0, 4.0]).magnitude());
+println!("{}", a.dot(&Vector::new(vec![1.0, 2.0])).unwrap_err());
+```
+
+Expected output:
+
+```text
+[5.0, 7.0, 9.0]
+[-3.0, -3.0, -3.0]
+Ok(32.0)
+5
+dimension mismatch: the left vector has 3 components, the right vector has 2
+```
+
+`examples/math_foundations.rs` contains a runnable version (Entry 6).
+
+## 10. What we learned
+
+**Mathematics:**
+
+- A vector is an ordered list of `n` numbers. It is also an arrow.
+- Addition and subtraction work component by component. They need equal
+  dimensions.
+- The dot product `Σ aᵢbᵢ` equals `‖a‖‖b‖cos(α)`. It measures length and
+  alignment. Attention uses it.
+- The magnitude `√(Σ vᵢ²)` is the theorem of Pythagoras in `n` dimensions.
+  `‖v‖² = v · v`.
+- `f64` values are rounded. Compare them with a tolerance.
+
+**Rust:**
+
+- A struct with a private field (a newtype) controls all access.
+- `Vec<f64>`: 24 bytes on the stack, the data on the heap.
+- `&self` borrows, `self` moves. A move of a `Vec` copies 24 bytes, not the
+  data.
+- Iterators (`iter`, `zip`, `map`, `sum`, `collect`) are lazy. They compile
+  to simple loops.
+- `Result` and `?` handle errors that the caller causes.
+- `#[derive]` generates `Debug`, `Clone` and `PartialEq`. A type that owns
+  heap memory cannot be `Copy`.
+- Edge-case tests find real bugs (the infinity bug in `approx_eq`).
+
+
+---
+
+# Entry 3 — Complex numbers (Stage 2, Component 2)
+
+**Date:** 2026-10-31
+**Stage:** 2 (Mathematical foundations)
+**File:** `src/math/complex.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `Complex` struct, `new`, `re`, `im`, constants `ZERO`, `ONE`, `I` | ✅ Implemented |
+| `+`, `−`, `×` with the `Add`, `Sub`, `Mul` traits | ✅ Implemented |
+| `conjugate`, `magnitude`, `phase` | ✅ Implemented |
+| Polar form and rotation (Euler's formula) | ⏳ Entry 6 (Component 5) |
+| Division, negation, scalar multiplication | ⏳ Not needed. Not implemented. |
+
+---
+
+## 1. What did we build?
+
+We built a type `Complex`. It represents a complex number `z = a + b·i`.
+We can:
+
+- create a complex number from its two components,
+- read the real component `a` and the imaginary component `b`,
+- add, subtract and multiply complex numbers with `+`, `−` and `*`,
+- calculate the conjugate, the magnitude and the phase.
+
+## 2. Why did we build it?
+
+RoPE rotates pairs of numbers. There are two equivalent ways to describe
+such a rotation:
+
+1. multiplication by a 2 × 2 rotation matrix (Entry 5),
+2. multiplication by a complex number of length 1 (Entry 6).
+
+The RoFormer paper uses the complex form to prove the most important
+property of RoPE: the attention score depends only on the **relative**
+position of two tokens. Many implementations (for example the original
+LLaMA code) also use complex numbers. Thus, we must understand complex
+numbers before we implement RoPE.
+
+## 3. Mathematical foundation
+
+### 3.1 What is a complex number?
+
+The equation `x² = −1` has no real solution, because the square of a real
+number is never negative. Mathematicians define a new number `i` with this
+property:
+
+```text
+i² = −1
+```
+
+`i` is the **imaginary unit**. A **complex number** is a number of this form:
+
+```text
+z = a + b·i
+```
+
+- `a` is a real number. It is the **real component** (`Re(z)`).
+- `b` is a real number. It is the **imaginary component** (`Im(z)`).
+  Note: the imaginary component is `b`, not `b·i`.
+
+**Examples.** `3 + 4i` has `a = 3`, `b = 4`. The real number `2` is
+`2 + 0i`. The number `i` is `0 + 1i`.
+
+### 3.2 Why two floating-point values are sufficient
+
+Two complex numbers are equal **only if** their real components are equal
+**and** their imaginary components are equal. Thus, the pair `(a, b)`
+identifies each complex number exactly. There is no other information.
+
+This gives a picture: the **complex plane**. The horizontal axis is the
+real axis. The vertical axis is the imaginary axis. The number `a + b·i` is
+the point `(a, b)`.
+
+```text
+          Im
+           │
+         4 ┤        • 3 + 4i  = point (3, 4)
+           │
+           │
+───────────┼──────────── Re
+           0        3
+```
+
+`a` and `b` are real numbers. A computer approximates a real number with an
+`f64`. Thus, a complex number is two `f64` values: 16 bytes.
+
+### 3.3 Addition and subtraction
+
+Add the real parts and the imaginary parts separately:
+
+```text
+(a + bi) + (c + di) = (a + c) + (b + d)i
+(a + bi) − (c + di) = (a − c) + (b − d)i
+```
+
+**Derivation.** Use the normal rules of algebra. Put the terms without `i`
+together and the terms with `i` together:
+`a + bi + c + di = (a + c) + (b + d)i`.
+
+**Geometric interpretation.** This is exactly vector addition of the points
+`(a, b)` and `(c, d)` (Entry 2).
+
+**Numerical example.** `(1 + 2i) + (3 − 5i) = 4 − 3i`.
+
+### 3.4 Multiplication
+
+```text
+(a + bi)(c + di) = (ac − bd) + (ad + bc)i
+```
+
+**Derivation.** Multiply each term of the first factor by each term of the
+second factor (the distributive law):
+
+```text
+(a + bi)(c + di) = a·c + a·di + bi·c + bi·di
+                 = ac + adi + bci + bd·i²
+```
+
+Now use `i² = −1`. Thus `bd·i² = −bd`:
+
+```text
+                 = ac + adi + bci − bd
+                 = (ac − bd) + (ad + bc)i
+```
+
+**Numerical example.**
+
+```text
+(1 + 2i)(3 + 4i):  a = 1, b = 2, c = 3, d = 4
+real part:      ac − bd = 1·3 − 2·4 = 3 − 8  = −5
+imaginary part: ad + bc = 1·4 + 2·3 = 4 + 6  = 10
+result:         −5 + 10i
+```
+
+**A preview of rotation.** Multiply `1` by `i`: `i·1 = i`. The point `(1, 0)`
+moves to `(0, 1)`. Multiply again: `i·i = −1`. The point moves to `(−1, 0)`.
+Each multiplication by `i` turns the point by 90° around the origin. The
+test `multiplication_by_i_rotates_by_a_quarter_turn` checks this. Entry 6
+generalizes this to any angle.
+
+### 3.5 The conjugate
+
+```text
+z̄ = a − b·i     (for z = a + b·i)
+```
+
+The bar over `z` means "conjugate". The conjugate changes the sign of the
+imaginary component.
+
+**Geometric interpretation.** The conjugate reflects the point `(a, b)`
+across the real axis, to `(a, −b)`. In terms of angles, it changes the angle
+`φ` to `−φ`. It reverses a rotation.
+
+**Important identity.**
+
+```text
+z · z̄ = (a + bi)(a − bi) = a² − abi + abi − b²i² = a² + b²
+```
+
+The result is a real number: the square of the length. The test
+`z_times_conjugate_is_magnitude_squared` checks `(3 + 4i)(3 − 4i) = 25`.
+
+**Where RoPE uses the conjugate.** The RoFormer paper writes the attention
+score as `Re[q_m · conj(k_n)]`. The conjugate of the key reverses the key's
+rotation. Thus, only the difference of the two rotation angles remains. We
+derive this in Stage 3.
+
+### 3.6 The magnitude
+
+```text
+|z| = √(a² + b²)
+```
+
+The vertical bars `| |` mean "magnitude" (also: modulus, absolute value).
+
+**Derivation.** The point `(a, b)` is the end of a right triangle with sides
+`a` and `b`. The theorem of Pythagoras gives the distance from the origin:
+`√(a² + b²)`. This is the 2-D Euclidean norm of Entry 2. From 3.5:
+`|z| = √(z · z̄)`.
+
+**Numerical example.** `|3 + 4i| = √(9 + 16) = 5`.
+
+**Property.** `|z·w| = |z|·|w|`. The magnitudes multiply.
+Example: `|3 + 4i| = 5` and `|5 + 12i| = 13`, so `|(3 + 4i)(5 + 12i)| = 65`.
+The test `magnitudes_multiply` checks this. **Consequence for RoPE:** if
+`|w| = 1`, multiplication by `w` does not change the length of `z`.
+
+### 3.7 The phase (argument)
+
+The **phase** `arg(z)` is the angle from the positive real axis to the
+arrow from `0` to `z`. It is measured in **radians** (Entry 4) and
+counterclockwise. The symbol is often `φ` (the Greek letter "phi").
+
+From the unit circle (Entry 4), a point with distance `r` and angle `φ` is:
+
+```text
+a = r·cos(φ),   b = r·sin(φ)
+```
+
+Thus `b / a = sin(φ) / cos(φ) = tan(φ)`, and a first idea is
+`φ = arctan(b / a)`. But this idea fails:
+
+- `1 + i` and `−1 − i` both have `b / a = 1`. `arctan(1) = π/4` for both.
+  But `−1 − i` is in the opposite direction. Its phase is `−3π/4`.
+- For `a = 0`, the division `b / a` is not defined.
+
+The function **`atan2(b, a)`** solves both problems. It uses the signs of
+`a` and `b` separately to find the correct quadrant. It returns a value in
+the range `[−π, π]`. In Rust the call is `b.atan2(a)`: note the order, `b`
+first.
+
+| `z` | `atan(b/a)` | `atan2(b, a)` = correct phase |
+|---|---|---|
+| `1 + i` | π/4 | π/4 (45°) |
+| `−1 − i` | π/4 (wrong) | −3π/4 (−135°) |
+| `0 + i` | undefined | π/2 (90°) |
+| `−1 + 0i` | −0 (wrong) | π (180°) |
+
+**The phase of zero.** `0 + 0i` has no direction. Its phase is not defined.
+`atan2(0, 0)` returns `0` by convention. Our test
+`phase_of_zero_is_zero_by_convention` documents this.
+
+**Property.** `arg(z·w) = arg(z) + arg(w)`. The phases add (if the sum stays
+in `[−π, π]`; else the result wraps around by `2π`). Example:
+`arg(1 + i) = π/4`, `arg(2i) = π/2`, and `(1 + i)(2i) = −2 + 2i` has phase
+`3π/4`. The test `phases_add_under_multiplication` checks this.
+
+**Summary: multiplication multiplies lengths and adds angles.** This is the
+key to Entry 6.
+
+### 3.8 Precision considerations
+
+- `+`, `−`, `×` on `f64` are correctly rounded. Results with small integers
+  are exact, so many tests correctly use `==`.
+- A product `ac − bd` can lose precision when `ac` and `bd` are almost
+  equal. The subtraction removes the equal leading digits
+  ("cancellation"), and the remaining digits contain the rounding errors.
+- `hypot(a, b)` avoids overflow and underflow. The naive `√(a² + b²)`
+  overflows when `a² > f64::MAX`, for example `a = 1e200`. The test
+  `magnitude_does_not_overflow_for_large_components` checks this.
+- `atan2` is accurate to about one unit in the last place, but `π/4` and
+  other results are irrational. Thus phase tests use `approx_eq`.
+
+## 4. Rust concepts learned
+
+### 4.1 `impl` blocks, `const` items and `const fn`
+
+```rust
+impl Complex {
+    pub const I: Complex = Complex::new(0.0, 1.0);
+    pub const fn new(re: f64, im: f64) -> Self { Self { re, im } }
+}
+```
+
+- An **associated constant** (`pub const I`) belongs to the type. You use it
+  as `Complex::I`.
+- A **`const fn`** can run at compile time. The compiler calculates
+  `Complex::new(0.0, 1.0)` during compilation and puts the result directly
+  into the program. A constant must have a value at compile time, so it can
+  only call `const fn` functions.
+- `Self { re, im }` is the **field init shorthand**. It means
+  `Self { re: re, im: im }`.
+
+`magnitude` and `phase` are not `const fn`, because `hypot` and `atan2` are
+not `const` in the standard library.
+
+### 4.2 `Copy` and `Clone`
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Complex { re: f64, im: f64 }
+```
+
+- **`Clone`** gives an explicit `.clone()` method. A clone can do any work,
+  for example allocate heap memory (as `Vector::clone` does).
+- **`Copy`** is a **marker trait**. It has no methods. It tells the
+  compiler: "a bitwise copy of this value is a complete, independent copy".
+  Then an assignment **copies** the value instead of a move. The original
+  stays usable.
+
+```rust
+let z = Complex::new(1.0, 2.0);
+let w = z;           // copy (Complex is Copy)
+println!("{z:?}");   // OK
+
+let v = vec![1.0];
+let u = v;           // move (Vec is not Copy)
+// println!("{v:?}"); // Error: `v` was moved
+```
+
+**Rule.** A type can be `Copy` only if all its fields are `Copy` and it has
+no `Drop` code. `f64` is `Copy`, so `Complex` can be `Copy`. `Vec` is not
+`Copy`, so `Vector` cannot be `Copy` (Entry 2, section 4.7). Every `Copy`
+type must also be `Clone`; this is why we derive both.
+
+**Why `Copy` for `Complex`?** It is 16 bytes, like two `u64` values. It is
+cheaper to copy 16 bytes than to manage a reference to them. With `Copy`,
+we can write `z * w` and still use `z` and `w` afterwards.
+
+**`Default`** gives `Complex::default()`, which is `0 + 0i`, because the
+default `f64` is `0.0`.
+
+### 4.3 Methods that take `self` by value
+
+```rust
+pub const fn conjugate(self) -> Self
+pub fn magnitude(self) -> f64
+```
+
+These methods take `self`, not `&self`. For a non-`Copy` type, this would
+**move** the value into the method. For a `Copy` type, it **copies** the
+value. The caller can still use it.
+
+Why not `&self`? A reference is 8 bytes and needs a memory read through a
+pointer. The value itself is 16 bytes and fits in two processor registers.
+For small `Copy` types, `self` by value is the idiomatic choice. The
+standard library does the same: `f64::sqrt(self)`.
+
+### 4.4 Traits and operator overloading
+
+A **trait** defines a set of methods that a type can implement. It is
+similar to an "interface" in other languages.
+
+The standard library defines the operator traits in `std::ops`. The
+compiler translates operators to trait method calls:
+
+| Expression | Compiler translation |
+|---|---|
+| `z + w` | `Add::add(z, w)` |
+| `z - w` | `Sub::sub(z, w)` |
+| `z * w` | `Mul::mul(z, w)` |
+
+The definition of `Add` (simplified):
+
+```rust
+pub trait Add<Rhs = Self> {
+    type Output;
+    fn add(self, rhs: Rhs) -> Self::Output;
+}
+```
+
+- `Rhs` ("right-hand side") is the type of the right operand. The default
+  is `Self`. Thus `impl Add for Complex` means `Complex + Complex`.
+- `type Output` is an **associated type**. It names the result type. For
+  `Complex + Complex`, the result is `Complex`.
+- `add` takes `self` **by value**. Because `Complex` is `Copy`, the operands
+  are copied, not moved.
+
+Our implementation:
+
+```rust
+impl Mul for Complex {
+    type Output = Complex;
+    fn mul(self, other: Complex) -> Complex {
+        let (a, b) = (self.re, self.im);
+        let (c, d) = (other.re, other.im);
+        Complex::new(a * c - b * d, a * d + b * c)
+    }
+}
+```
+
+The local names `a`, `b`, `c`, `d` are the same as in the equation. This
+makes it easy to compare the code with the mathematics. The
+`let (a, b) = (...)` syntax is **destructuring**: it unpacks a tuple into
+two variables.
+
+**Why operators for `Complex`, but named methods for `Vector`?** Complex
+operations cannot fail. Every `Complex + Complex` has a result. Vector
+operations can fail on a dimension mismatch (Entry 2, section 6.1).
+
+**Static dispatch.** The compiler knows the exact type at compile time. It
+calls `Complex::mul` directly, and it usually **inlines** it (it copies the
+function body into the caller). There is no runtime cost for the trait.
+
+### 4.5 Private fields with accessor methods
+
+The fields `re` and `im` are private. The methods `re()` and `im()` return
+them. This keeps the same style as `Vector`. It also allows a later change of
+the internal representation (for example, to `[f64; 2]`) without breaking
+code that uses `Complex`.
+
+Note: in Rust, a field and a method can have the same name. `z.re` is the
+field (only visible inside the module). `z.re()` is the method.
+
+### 4.6 Floating-point methods
+
+| Method | Mathematics |
+|---|---|
+| `x.hypot(y)` | `√(x² + y²)` without overflow |
+| `y.atan2(x)` | the angle of the point `(x, y)`, in `[−π, π]` |
+| `x.sqrt()` | `√x` |
+
+These are methods of the primitive type `f64`. The standard library
+implements them with the platform's mathematics library.
+
+### 4.7 A test helper with a custom panic message
+
+```rust
+fn assert_complex_eq(actual: Complex, expected: Complex) {
+    assert!(cond, "expected {expected:?}, got {actual:?}");
+}
+```
+
+`assert!` accepts a format message after the condition. `{expected:?}`
+is **inline format arguments**: the variable name inside the braces. If the
+test fails, the message shows both values.
+
+## 5. Memory and execution
+
+**Layout.** `Complex` is two `f64` values: 16 bytes, alignment 8. There are
+no pointers and no heap data.
+
+```text
+ Stack (or two registers)
+┌──────────┬──────────┐
+│ re: f64  │ im: f64  │
+└──────────┴──────────┘
+   8 bytes    8 bytes
+```
+
+Note: the default Rust layout (`repr(Rust)`) does not guarantee the field
+order. For two fields of the same type, the order does not matter for us.
+If we needed a fixed order (for example, to share memory with C code), we
+would add `#[repr(C)]`.
+
+**Execution of `z * w`:**
+
+1. The compiler copies `z` and `w` into the arguments of `Mul::mul`. With
+   inlining, they usually stay in registers. No memory is used.
+2. The processor calculates four multiplications (`ac`, `bd`, `ad`, `bc`),
+   one subtraction and one addition.
+3. The result is a new `Complex`, returned in registers.
+4. `z` and `w` are unchanged and still usable.
+
+**Ownership summary:**
+
+| Operation | Allocation | Ownership |
+|---|---|---|
+| `Complex::new` | none | creates a value |
+| `z + w`, `z - w`, `z * w` | none | copies `z` and `w` |
+| `conjugate`, `magnitude`, `phase` | none | copies `self` |
+
+**Scope.** When a `Complex` goes out of scope, nothing happens. There is no
+heap memory to free and no `Drop` code.
+
+## 6. Engineering decisions
+
+1. **A struct with two `f64` fields.** It matches the mathematics `(a, b)`.
+   It has a clear name and methods.
+2. **`Copy`.** The type is small and has no heap data. Copy semantics make
+   the arithmetic code natural.
+3. **Operator traits only for `+`, `−`, `×`.** These are the operations
+   that the task needs. We did not add division or negation, because no
+   later step needs them yet. (No speculative features.)
+4. **`hypot` instead of `(a*a + b*b).sqrt()`.** It is overflow-safe. In
+   Entry 2, `Vector::magnitude` uses the simple formula. We kept both:
+   for `n` dimensions the standard library has no `hypot`, and an extra
+   scaling pass costs time.
+5. **`atan2` instead of `atan`.** It finds the correct quadrant and handles
+   `a = 0`.
+6. **No dependency on `num-complex`.** The project rule is to implement the
+   primitives ourselves.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Tuple `(f64, f64)` | No new type | No methods, no operators, no meaning in the type |
+| Public fields `pub re`, `pub im` | Shorter code (`z.re`). The `num-complex` crate does this | Users can change components directly. Less control |
+| Polar storage `(r, φ)` | Multiplication is cheap (`r₁r₂`, `φ₁ + φ₂`) | Addition needs `sin`/`cos`. Angles need wrapping. More rounding |
+| Generic `Complex<T>` | Works with `f32` and `f64` | Needs a numeric trait. More complex code. Not needed now |
+| `num-complex` crate | Complete, tested | Hides the concepts. Adds a dependency |
+| `impl Add<&Complex> for &Complex` | Works without `Copy` | Not needed: `Complex` is `Copy` |
+
+## 8. Performance considerations
+
+- **Time.** Every operation is O(1). Multiplication needs 4 multiplications
+  and 2 additions. Modern processors can also use FMA (fused
+  multiply-add, `a·c − b·d` in one instruction with one rounding) if the
+  compiler enables it.
+- **Memory.** 16 bytes, no heap. An array of `n` complex numbers uses
+  `16·n` bytes, contiguous.
+- **Inlining.** The trait methods are small. The compiler inlines them in
+  optimized builds. There is no function call overhead.
+- **`hypot` versus `sqrt`.** `hypot` is slower than `(a*a + b*b).sqrt()`,
+  because it must avoid overflow. In a hot loop, the simple formula can be
+  faster. Stage 6 can measure this.
+- **`atan2`** is a relatively expensive function (tens of processor cycles).
+  RoPE does not need `phase` in its main calculation. It needs `cos` and
+  `sin` of known angles.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::complex::Complex;
+
+let z = Complex::new(1.0, 2.0);
+let w = Complex::new(3.0, 4.0);
+
+println!("{:?}", z + w);
+println!("{:?}", z * w);
+println!("{:?}", Complex::I * Complex::I);
+println!("{:?}", w.conjugate());
+println!("{}", w.magnitude());
+println!("{}", Complex::new(-1.0, -1.0).phase());
+```
+
+Expected output:
+
+```text
+Complex { re: 4.0, im: 6.0 }
+Complex { re: -5.0, im: 10.0 }
+Complex { re: -1.0, im: 0.0 }
+Complex { re: 3.0, im: -4.0 }
+5
+-2.356194490192345
+```
+
+`−2.356194490192345` is `−3π/4` (−135°).
+
+## 10. What we learned
+
+**Mathematics:**
+
+- `i² = −1`. A complex number `a + bi` is a point `(a, b)` in the plane.
+- Addition is vector addition.
+- Multiplication: `(ac − bd) + (ad + bc)i`. We derived it from the
+  distributive law and `i² = −1`.
+- Multiplication **multiplies the magnitudes** and **adds the phases**.
+  Multiplication by `i` is a 90° rotation.
+- The conjugate reflects across the real axis. `z·z̄ = |z|²`.
+- `atan2` gives the correct phase in all four quadrants.
+
+**Rust:**
+
+- `Copy` types are copied, not moved. Only types without heap data can be
+  `Copy`.
+- Operator overloading uses the traits `Add`, `Sub`, `Mul` with an
+  associated `Output` type.
+- `const fn` and associated constants run at compile time.
+- Small `Copy` types take `self` by value, not `&self`.
+- Trait calls on known types use static dispatch and inlining: zero cost.
+
+
+---
+
+# Entry 4 — Trigonometry (Stage 2, Component 3)
+
+**Date:** 2026-10-31
+**Stage:** 2 (Mathematical foundations)
+**File:** `src/math/trigonometry.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `degrees_to_radians`, `radians_to_degrees` | ✅ Implemented |
+| `sine`, `cosine`, `sin_cos` | ✅ Implemented (calls to the standard library) |
+| `unit_circle_point` | ✅ Implemented |
+| Precomputed sine/cosine tables | ⏳ Planned (Stage 3 or 6, a RoPE cache) |
+| Our own sine/cosine algorithm (for example a Taylor series) | ❌ Not planned. See section 7. |
+
+---
+
+## 1. What did we build?
+
+We built a small module with six functions:
+
+| Function | Calculation |
+|---|---|
+| `degrees_to_radians(deg)` | `deg × π / 180` |
+| `radians_to_degrees(rad)` | `rad × 180 / π` |
+| `sine(θ)` | `sin(θ)` |
+| `cosine(θ)` | `cos(θ)` |
+| `sin_cos(θ)` | `(sin(θ), cos(θ))` in one call |
+| `unit_circle_point(θ)` | `[cos(θ), sin(θ)]` |
+
+## 2. Why did we build it?
+
+RoPE rotates each pair of numbers by an angle. To rotate by an angle `θ`,
+we need `cos(θ)` and `sin(θ)` (Entry 5). Every RoPE calculation therefore
+calls sine and cosine. In a real model, it calls them millions of times.
+
+This module gives one central place for these calls. The rotation matrix
+(Entry 5) and the polar form of complex numbers (Entry 6) both use it.
+
+## 3. Mathematical foundation
+
+### 3.1 Angles: degrees and radians
+
+An **angle** measures a rotation. There are two common units.
+
+**Degrees.** A full turn is 360 degrees (360°). This number is historical.
+It has no special mathematical meaning.
+
+**Radians.** Draw a circle with radius `r`. Walk along the circle from the
+positive `x` axis. Let `s` be the length of the path along the circle (the
+**arc length**). Then the angle in radians is:
+
+```text
+θ = s / r
+```
+
+A full turn walks around the full circumference `2πr`. Thus a full turn is
+`2πr / r = 2π` radians.
+
+```text
+360° = 2π rad    →    180° = π rad    →    1° = π/180 rad
+```
+
+From this, we get the conversion formulas:
+
+```text
+θ_radians = θ_degrees × π / 180
+θ_degrees = θ_radians × 180 / π
+```
+
+**Numerical examples:**
+
+| Degrees | Radians (exact) | Radians (decimal) |
+|---|---|---|
+| 0° | 0 | 0 |
+| 30° | π/6 | 0.5236 |
+| 45° | π/4 | 0.7854 |
+| 90° | π/2 | 1.5708 |
+| 180° | π | 3.1416 |
+| 270° | 3π/2 | 4.7124 |
+| 360° | 2π | 6.2832 |
+
+Example calculation: `90 × π / 180 = π / 2 ≈ 1.5708`.
+
+### 3.2 Why computers (and mathematics) use radians
+
+Radians are the **natural** unit. Three reasons:
+
+1. **Arc length is simple.** With radians, the arc length is `s = r·θ`. With
+   degrees, it is `s = r·θ·π/180`.
+2. **The derivatives are simple.** The derivative (the rate of change) of
+   `sin(θ)` is `cos(θ)` **only** when `θ` is in radians. In degrees, it is
+   `(π/180)·cos(θ)`. Many formulas, for example the Taylor series
+   `sin(θ) = θ − θ³/6 + ...`, are only correct in radians.
+3. **Small angles.** For a small `θ` in radians, `sin(θ) ≈ θ`. Example:
+   `sin(0.01) = 0.0099998...`. In degrees, this simple approximation does
+   not exist.
+
+For these reasons, the standard library functions `f64::sin` and
+`f64::cos` expect radians. RoPE also uses radians: the angle of pair `i` at
+position `m` is `m·θᵢ` radians.
+
+### 3.3 The unit circle
+
+The **unit circle** is the circle with radius 1 and its centre at the
+origin `(0, 0)`.
+
+Start at the point `(1, 0)`. Turn counterclockwise by the angle `θ`. You
+arrive at a point `P` on the circle. By definition:
+
+```text
+x = cos(θ)     (the horizontal coordinate of P)
+y = sin(θ)     (the vertical coordinate of P)
+```
+
+```text
+              y
+              │   P = (cos θ, sin θ)
+         1 ┤  │  •
+              │ /│
+              │/ │ sin θ
+──────────────┼──┴──────── x
+              │cos θ   1
+```
+
+This is the definition of sine and cosine for **all** angles, also for
+negative angles and angles larger than 2π.
+
+**The four quarter turns:**
+
+| θ (degrees) | θ (radians) | Point `(cos θ, sin θ)` |
+|---|---|---|
+| 0° | 0 | (1, 0) |
+| 90° | π/2 | (0, 1) |
+| 180° | π | (−1, 0) |
+| 270° | 3π/2 | (0, −1) |
+
+**Link to right triangles.** Draw a vertical line from `P` to the `x` axis.
+This makes a right triangle with hypotenuse 1. The side next to the angle
+has the length `cos(θ)`. The opposite side has the length `sin(θ)`. For a
+triangle with hypotenuse `r`, multiply by `r`: the sides are `r·cos(θ)` and
+`r·sin(θ)`. We used this in Entries 2 and 3.
+
+### 3.4 The Pythagorean identity
+
+`P` is on the unit circle, so its distance from the origin is 1. The
+theorem of Pythagoras gives:
+
+```text
+cos²(θ) + sin²(θ) = 1
+```
+
+(`sin²(θ)` means `(sin(θ))²`.) The test `pythagorean_identity` checks this
+for many angles. The test `unit_circle_points_have_length_one` checks the
+same fact with `hypot`.
+
+**Consequence.** `−1 ≤ sin(θ) ≤ 1` and `−1 ≤ cos(θ) ≤ 1`.
+
+### 3.5 Symmetry
+
+Turn by `−θ` (clockwise). The point is the reflection of `P` across the `x`
+axis: `(cos θ, −sin θ)`. Thus:
+
+```text
+cos(−θ) =  cos(θ)    (cosine is an "even" function)
+sin(−θ) = −sin(θ)    (sine is an "odd" function)
+```
+
+The test `sine_is_odd_and_cosine_is_even` checks this.
+
+### 3.6 Periodicity
+
+A full turn (2π radians) returns to the same point. Thus:
+
+```text
+sin(θ + 2πk) = sin(θ)
+cos(θ + 2πk) = cos(θ)        for every integer k
+```
+
+The **period** of sine and cosine is `2π`. The test
+`periodicity_with_period_two_pi` checks this.
+
+**Why periodicity is important for RoPE.** The rotation angle of pair `i`
+at position `m` is `m·θᵢ`. Because of periodicity, the rotation repeats
+after `2π / θᵢ` positions. This number is the **wavelength** of the pair.
+RoPE uses many different frequencies `θᵢ` so that the combination of all
+pairs does not repeat for a very long distance. Stage 3 studies this.
+
+### 3.7 Two angle-addition formulas (for later entries)
+
+```text
+cos(α + β) = cos(α)·cos(β) − sin(α)·sin(β)
+sin(α + β) = sin(α)·cos(β) + cos(α)·sin(β)
+```
+
+`α` and `β` are two angles. **Derivation** (with the result of Entry 3:
+complex multiplication adds the phases). The unit-circle points
+`u = cos α + i·sin α` and `v = cos β + i·sin β` both have magnitude 1.
+Their product `u·v` has magnitude `1·1 = 1` and phase `α + β`. Thus
+`u·v = cos(α + β) + i·sin(α + β)`. Now multiply with the formula of
+Entry 3, `(ac − bd) + (ad + bc)i`, where `a = cos α`, `b = sin α`,
+`c = cos β`, `d = sin β`:
+
+```text
+real part:      cos α·cos β − sin α·sin β   = cos(α + β)
+imaginary part: cos α·sin β + sin α·cos β   = sin(α + β)
+```
+
+Entry 5 uses these formulas to derive the rotation matrix.
+
+### 3.8 Floating-point precision
+
+This is the most important precision topic of Stage 2. We measured these
+values on this computer:
+
+| Calculation | Mathematical value | `f64` result |
+|---|---|---|
+| `cos(π/2)` | 0 | `6.123233995736766e-17` |
+| `sin(π)` | 0 | `1.2246467991473532e-16` |
+| `cos(3π/2)` | 0 | `-1.8369701987210297e-16` |
+| `sin(2π)` | 0 | `-2.4492935982947064e-16` |
+| `sin(π/6)` | 0.5 | `0.49999999999999994` |
+| `cos(π/3)` | 0.5 | `0.5000000000000001` |
+| `sin(2π · 10⁶)` | 0 | `-4.463824362721742e-10` |
+
+**Why is `sin(π)` not zero?** The `sin` function is not wrong. The
+**input** is wrong. `π` is irrational: it has infinitely many digits. The
+constant `std::f64::consts::PI` is the nearest `f64` value:
+
+```text
+PI (f64) = π − δ,    δ ≈ 1.2246e-16
+```
+
+Near `π`, `sin(π − δ) = sin(δ) ≈ δ` (the small-angle rule from 3.2). Thus
+`sin(PI)` returns `1.2246e-16`. This is the correct sine of the number that
+we gave it.
+
+**The error grows with the angle.** An `f64` has about 16 significant
+decimal digits. For a value near `6.28 · 10⁶`, the spacing between two
+neighbouring `f64` values is about `10⁻⁹`. Thus the angle itself has a
+rounding error of up to half this spacing, about `5 · 10⁻¹⁰`. The measured
+result `−4.46e-10` is this rounding error. `sin` returns it.
+
+The rule: **the absolute error of an angle in `f64` is about
+`|θ| × 1.1 × 10⁻¹⁶`.** Large angles have large absolute errors.
+
+**Why this matters for RoPE.** The angle is `m·θᵢ`. For the first pair,
+`θ₀ = 1`, so at position `m = 100 000` the angle is `100 000` radians. In
+`f64`, the error is about `10⁻¹¹`. This is acceptable. In `f32`
+(7 significant digits) the error is about `0.004` radians. This is much
+larger. This is one reason that real implementations calculate the angles
+carefully. Stage 3 and Stage 6 study it. The test
+`precision_loss_for_large_angles` documents the effect.
+
+**Conversion precision.** `degrees_to_radians(180.0)` returns exactly
+`PI`, because the rounding errors cancel for this value. But in general,
+the conversion has a rounding error of about one unit in the last digit.
+`radians_to_degrees(degrees_to_radians(x))` is usually equal to `x`
+within the tolerance, but not always bit for bit.
+
+## 4. Rust concepts learned
+
+### 4.1 Free functions in a module
+
+The functions in this module are **free functions**: they are not methods
+of a type. A free function is the natural choice when there is no data
+type that owns the operation. Callers use the module path:
+
+```rust
+use rust_rope::math::trigonometry::{sin_cos, degrees_to_radians};
+let (s, c) = sin_cos(degrees_to_radians(30.0));
+```
+
+### 4.2 Methods on primitive types
+
+`f64` is a primitive type, but it has methods: `theta.sin()`,
+`theta.cos()`, `theta.sin_cos()`. The standard library defines them in an
+`impl f64` block. `theta.sin()` and `f64::sin(theta)` are the same call. We
+use the second form in a test: `f64::to_radians(degrees)`.
+
+### 4.3 Constants from `std::f64::consts`
+
+`PI`, `TAU` (`2π`), `FRAC_PI_2` (`π/2`), `FRAC_PI_4` (`π/4`),
+`FRAC_PI_6` (`π/6`), `FRAC_1_SQRT_2` (`1/√2`) and `SQRT_2` (`√2`) are
+predefined constants. Each is the nearest `f64` value to the exact
+mathematical value. Use them instead of writing `3.14159...` by hand.
+
+### 4.4 Constant folding
+
+```rust
+degrees * (PI / 180.0)
+```
+
+`PI / 180.0` contains only constants. The compiler calculates it during
+compilation (**constant folding**). The program contains only one
+multiplication. The parentheses matter: `degrees * PI / 180.0` means
+`(degrees * PI) / 180.0`. That is one multiplication **and** one division
+at run time, and it can round differently.
+
+### 4.5 Tuples
+
+`sin_cos` returns a **tuple** `(f64, f64)`. A tuple groups values of fixed
+number and type, without names. The caller unpacks it with destructuring:
+
+```rust
+let (s, c) = sin_cos(theta);
+```
+
+A tuple of two `f64` values is 16 bytes. It is returned in registers. No
+allocation occurs.
+
+### 4.6 Fixed-size arrays `[f64; 2]`
+
+`unit_circle_point` returns `[f64; 2]`: an array with exactly two `f64`
+values.
+
+- The size is part of the **type**. `[f64; 2]` and `[f64; 3]` are different
+  types. Thus the compiler knows that a 2-D point always has 2 components.
+  No dimension error is possible at run time.
+- The array is stored **inline**: on the stack, or in registers. No heap.
+- `[f64; 2]` is `Copy`, because `f64` is `Copy`.
+
+Compare with `Vector` (Entry 2): `Vec<f64>` has a size that is known only
+at run time, so it needs the heap and a runtime dimension check.
+
+| | `[f64; 2]` | `Vector` (`Vec<f64>`) |
+|---|---|---|
+| Size known at | compile time | run time |
+| Storage | inline (stack) | heap |
+| Size in bytes | 16 | 24 (stack) + 8·n (heap) |
+| `Copy` | yes | no |
+| Dimension check | by the compiler | at run time (`Result`) |
+
+**Array patterns.** `let [x, y] = unit_circle_point(theta);` unpacks the
+array. The compiler accepts this pattern only for an array with exactly 2
+elements.
+
+### 4.7 `#[inline]`
+
+`#[inline]` is a hint to the compiler: "copy the body of this function into
+the caller". Without the attribute, the compiler can inline a function only
+inside its own crate (unless link-time optimization is on). With
+`#[inline]`, other crates (our tests, examples and benchmarks) can also
+inline it. For a one-line wrapper around `f64::sin`, inlining removes all
+cost of the wrapper.
+
+### 4.8 Tests with loops and arrays of cases
+
+```rust
+for (theta, [ex, ey]) in expected { ... }
+```
+
+Many tests iterate over an array of test cases. One test checks a property
+for many input values. The pattern `(theta, [ex, ey])` unpacks each tuple
+and its inner array.
+
+## 5. Memory and execution
+
+- Every function takes `f64` values **by value**. `f64` is `Copy`. Nothing
+  is borrowed or moved in a way that the caller can see.
+- No function allocates. All values live in registers or on the stack.
+- **Execution of `sin_cos(θ)`:** the standard library calls the platform
+  mathematics library. The algorithm first reduces `θ` into a small range
+  near zero, with the periodicity of section 3.6 ("range reduction"). Then
+  it evaluates a polynomial that approximates sine and cosine in that range.
+  `sin_cos` can share the range reduction for both results.
+- Nothing needs to be freed when the values go out of scope.
+
+## 6. Engineering decisions
+
+1. **We wrap the standard library functions.** The task permits standard
+   library methods. They are accurate (usually within one unit in the last
+   place) and fast. Our own implementation would be slower and less
+   accurate.
+2. **We wrote the conversion formulas ourselves,** because the task asks us
+   to learn the equation. We used the same expression as the standard
+   library, `x * (π / 180)`. The test
+   `conversion_matches_the_standard_library_exactly` proves that the results
+   are bit-for-bit equal.
+3. **`sin_cos` returns `(sin, cos)`.** This is the order of `f64::sin_cos`.
+   A different order would confuse users who know the standard library.
+4. **`unit_circle_point` returns `[cos, sin]`.** This is the order `(x, y)`.
+   Note the difference from `sin_cos`. The function name tells the
+   meaning: a point is `(x, y)`.
+5. **Radians everywhere.** Only `degrees_to_radians` accepts degrees. All
+   other functions expect radians. This prevents a mix of units.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Our own Taylor series for sine | We learn the approximation | Less accurate, slower, and needs range reduction. Not the goal of this project |
+| A lookup table of sine values | Very fast for repeated angles | Needs memory, and has interpolation errors. RoPE uses a different form: a table of `cos(m·θᵢ)` for all positions (Stage 3) |
+| A newtype `Radians(f64)` | The compiler prevents unit mistakes | Extra syntax at every call. Not needed in a small project |
+| Call `f64::sin` directly in all modules | No wrapper | The mathematics is spread out. No central place for documentation |
+| `f32` instead of `f64` | Two times less memory, faster SIMD | 7 digits. Large angles lose much precision (section 3.8) |
+
+## 8. Performance considerations
+
+- **Conversion:** one multiplication. About 1 processor cycle.
+- **`sin`, `cos`:** about 20 to 100 cycles each, depending on the platform
+  and on the size of the angle. Large angles need a more expensive range
+  reduction.
+- **`sin_cos`:** can be faster than two calls. Rust does not guarantee it.
+  Stage 6 can measure it.
+- **Implication for RoPE:** sine and cosine are expensive compared to
+  multiplication. RoPE needs `cos(m·θᵢ)` and `sin(m·θᵢ)` for all positions
+  `m` and pairs `i`. These values do not depend on the input data. Thus
+  real implementations calculate them **one time** and store them in a
+  table ("cache"). We plan this in Stage 3.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::trigonometry::*;
+
+for degrees in [0.0, 90.0, 180.0, 270.0] {
+    let theta = degrees_to_radians(degrees);
+    let [x, y] = unit_circle_point(theta);
+    println!("{degrees:>5}° = {theta:.4} rad -> ({x:e}, {y:e})");
+}
+```
+
+Expected output:
+
+```text
+    0° = 0.0000 rad -> (1e0, 0e0)
+   90° = 1.5708 rad -> (6.123233995736766e-17, 1e0)
+  180° = 3.1416 rad -> (-1e0, 1.2246467991473532e-16)
+  270° = 4.7124 rad -> (-1.8369701987210297e-16, -1e0)
+```
+
+The values `6.1e-17`, `1.2e-16` and `−1.8e-16` are the mathematical zeros.
+Section 3.8 explains them. `{:e}` prints in scientific notation, so the
+small errors are visible. `{:.4}` prints 4 decimal places.
+
+## 10. What we learned
+
+**Mathematics:**
+
+- Radians measure an angle by arc length: `θ = s / r`. A full turn is `2π`.
+  `θ_rad = θ_deg × π / 180`.
+- Radians are the natural unit: the formulas for derivatives, series and
+  small angles are simple only in radians.
+- On the unit circle, the point at angle `θ` is `(cos θ, sin θ)`.
+- `sin² + cos² = 1`. Cosine is even, sine is odd. Both have the period `2π`.
+- Periodicity creates the "wavelength" `2π / θᵢ` of each RoPE pair.
+- The angle-addition formulas follow from complex multiplication.
+- `sin(PI) ≠ 0` because `PI` is not exactly `π`. The absolute error of an
+  angle grows with its size. `f32` is much worse than `f64` for large
+  angles.
+
+**Rust:**
+
+- Free functions, methods on primitives, and `std::f64::consts`.
+- Constant folding: `x * (PI / 180.0)` is one multiplication.
+- Tuples and fixed-size arrays are stored inline and are `Copy`.
+- `[f64; 2]` puts the dimension into the type. The compiler checks it.
+- `#[inline]` allows inlining across crates.
+
+
+---
+
+# Entry 5 — 2 × 2 matrices and rotation matrices (Stage 2, Component 4)
+
+**Date:** 2026-10-31
+**Stage:** 2 (Mathematical foundations)
+**File:** `src/math/matrix.rs` (the `Vector2`, `Matrix2` and
+`rotate_vector` part)
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `Vector2` (type alias for `[f64; 2]`) | ✅ Implemented |
+| `Matrix2`: `new`, `from_rows`, `rows`, `get`, `IDENTITY` | ✅ Implemented |
+| `transpose`, `determinant` | ✅ Implemented |
+| `mul_vector` (matrix-vector), `mul_matrix` (matrix-matrix) | ✅ Implemented |
+| `Matrix2::rotation(θ)`, `rotate_vector(v, θ)` | ✅ Implemented |
+| General `n × n` matrices | ❌ Not planned. RoPE needs only 2 × 2 blocks. |
+| Rotation of RoPE dimension pairs | ⏳ Planned (Stages 3–4) |
+
+---
+
+## 1. What did we build?
+
+We built:
+
+- `Vector2`: a 2-D vector `[x, y]` as a fixed-size array `[f64; 2]`.
+- `Matrix2`: a 2 × 2 matrix, with construction, element access, transpose,
+  determinant, matrix-vector multiplication and matrix-matrix
+  multiplication.
+- `Matrix2::rotation(θ)`: the rotation matrix `R(θ)`.
+- `rotate_vector(v, θ)`: rotates `v` around the origin by `θ` radians.
+
+We did not duplicate the vector operations of Entry 2. The tests calculate
+the lengths and dot products of `Vector2` values with the existing `Vector`
+type.
+
+## 2. Why did we build it?
+
+The rotation matrix is the core operation of RoPE. RoPE takes a vector with
+`d` components and divides it into `d/2` pairs. It rotates each pair with
+its own `R(θ)`. Thus, RoPE is "many 2-D rotations at the same time". If we
+understand one 2-D rotation completely, we understand the core of RoPE.
+
+The general matrix operations (multiplication, transpose) are necessary to
+prove the important properties: a rotation keeps lengths, and two rotations
+combine into one rotation by the sum of the angles.
+
+## 3. Mathematical foundation
+
+### 3.1 What is a matrix?
+
+A **matrix** is a rectangular table of numbers. A 2 × 2 matrix has 2 rows
+and 2 columns:
+
+```text
+M = [ a  b ]      row 1: a, b
+    [ c  d ]      row 2: c, d
+```
+
+A matrix describes a **linear transformation**: a rule that moves every
+point of the plane to a new point. "Linear" means that the rule keeps
+straight lines straight and keeps the origin fixed.
+
+### 3.2 Matrix-vector multiplication
+
+```text
+[ a  b ] [ x ]   [ a·x + b·y ]
+[ c  d ] [ y ] = [ c·x + d·y ]
+```
+
+Each component of the result is the **dot product** of one row with the
+vector (Entry 2). Row 1 · `[x, y]` = `a·x + b·y`.
+
+**Numerical example.**
+
+```text
+[ 1  2 ] [ 5 ]   [ 1·5 + 2·6 ]   [ 17 ]
+[ 3  4 ] [ 6 ] = [ 3·5 + 4·6 ] = [ 39 ]
+```
+
+**The column interpretation (important for the derivation below).** Write
+the product in another way:
+
+```text
+M·[x, y] = x·[a, c] + y·[b, d]
+```
+
+The vector `[1, 0]` gives `M·[1, 0] = [a, c]`: the **first column**. The
+vector `[0, 1]` gives `M·[0, 1] = [b, d]`: the **second column**. Thus:
+
+> **The columns of `M` are the images of the two axis vectors.**
+> Column 1 shows where `[1, 0]` goes. Column 2 shows where `[0, 1]` goes.
+
+### 3.3 Matrix-matrix multiplication
+
+```text
+[ a  b ] [ e  f ]   [ a·e + b·g   a·f + b·h ]
+[ c  d ] [ g  h ] = [ c·e + d·g   c·f + d·h ]
+```
+
+The element in row `r`, column `c` of the result is the dot product of row
+`r` of the first matrix with column `c` of the second matrix.
+
+**Derivation.** We want a matrix `P` with `P·v = M·(N·v)` for all `v`:
+"first apply `N`, then apply `M`". Calculate `N·v = [e·x + f·y, g·x + h·y]`.
+Then apply `M`:
+
+```text
+first component:  a·(e·x + f·y) + b·(g·x + h·y) = (a·e + b·g)·x + (a·f + b·h)·y
+second component: c·(e·x + f·y) + d·(g·x + h·y) = (c·e + d·g)·x + (c·f + d·h)·y
+```
+
+The coefficients of `x` and `y` are exactly the elements of `M·N`. The test
+`product_matrix_applies_right_factor_first` checks `(M·N)·v = M·(N·v)`.
+
+**Numerical example.**
+
+```text
+[ 1  2 ] [ 5  6 ]   [ 1·5 + 2·7   1·6 + 2·8 ]   [ 19  22 ]
+[ 3  4 ] [ 7  8 ] = [ 3·5 + 4·7   3·6 + 4·8 ] = [ 43  50 ]
+```
+
+**The order is important.** In the opposite order, `N·M` gives
+`[[23, 34], [31, 46]]`. Matrix multiplication is **not commutative**: in
+general `M·N ≠ N·M`. (Exception: two rotation matrices commute, because
+`R(α)·R(β) = R(α + β) = R(β + α)`.)
+
+### 3.4 The identity, the transpose and the determinant
+
+- The **identity** `I = [[1, 0], [0, 1]]` changes nothing: `I·v = v` and
+  `I·M = M·I = M`.
+- The **transpose** `Mᵀ` changes rows into columns:
+  `[[a, b], [c, d]]ᵀ = [[a, c], [b, d]]`.
+- The **determinant** `det(M) = a·d − b·c` is one number. `|det(M)|` is the
+  factor by which `M` scales areas. If `det(M) < 0`, `M` also reflects the
+  plane (it changes "counterclockwise" into "clockwise"). Example:
+  `det([[1, 2], [3, 4]]) = 1·4 − 2·3 = −2`.
+
+### 3.5 Derivation of the rotation matrix — method 1: the axis vectors
+
+We want the matrix `R(θ)` that rotates every vector counterclockwise by the
+angle `θ` around the origin. From 3.2, we only need to know where the two
+axis vectors go.
+
+- `[1, 0]` is the point at angle 0 on the unit circle. Rotate it by `θ`. It
+  arrives at the point at angle `θ`: `[cos θ, sin θ]` (Entry 4). This is
+  **column 1**.
+- `[0, 1]` is the point at angle `π/2`. Rotate it by `θ`. It arrives at
+  angle `θ + π/2`: `[cos(θ + π/2), sin(θ + π/2)]`. Use the angle-addition
+  formulas (Entry 4, section 3.7) with `cos(π/2) = 0` and `sin(π/2) = 1`:
+
+```text
+cos(θ + π/2) = cos θ·0 − sin θ·1 = −sin θ
+sin(θ + π/2) = sin θ·0 + cos θ·1 =  cos θ
+```
+
+  This is **column 2**: `[−sin θ, cos θ]`.
+
+Put the two columns together:
+
+```text
+R(θ) = [ cos θ   −sin θ ]
+       [ sin θ    cos θ ]
+```
+
+### 3.6 Derivation of the rotation matrix — method 2: polar coordinates
+
+Write the vector `v = [x, y]` with its length `r` and its angle `φ`
+(Entry 4, section 3.3):
+
+```text
+x = r·cos φ,    y = r·sin φ
+```
+
+A rotation by `θ` keeps the length `r` and adds `θ` to the angle. The new
+vector `[x', y']` (read "x prime", "y prime") is:
+
+```text
+x' = r·cos(φ + θ),    y' = r·sin(φ + θ)
+```
+
+Expand with the angle-addition formulas:
+
+```text
+x' = r·(cos φ·cos θ − sin φ·sin θ) = (r·cos φ)·cos θ − (r·sin φ)·sin θ
+y' = r·(sin φ·cos θ + cos φ·sin θ) = (r·cos φ)·sin θ + (r·sin φ)·cos θ
+```
+
+Replace `r·cos φ` by `x`, and `r·sin φ` by `y`:
+
+```text
+x' = x·cos θ − y·sin θ
+y' = x·sin θ + y·cos θ
+```
+
+This is exactly `R(θ)·[x, y]` from 3.2. Both methods give the same matrix.
+
+### 3.7 Why `R(θ)` rotates around the origin
+
+A transformation is a rotation around the origin if it has three
+properties. We prove each property.
+
+**(1) It keeps the origin fixed.** `R(θ)·[0, 0] = [0, 0]`. Every matrix does
+this. (Test: `rotating_the_zero_vector_gives_zero`.)
+
+**(2) It keeps lengths.** Calculate `x'² + y'²`:
+
+```text
+x'² = x²cos²θ − 2xy·cosθ·sinθ + y²sin²θ
+y'² = x²sin²θ + 2xy·sinθ·cosθ + y²cos²θ
+sum = x²(cos²θ + sin²θ) + y²(sin²θ + cos²θ)    (the 2xy terms cancel)
+    = x² + y²                                  (because sin² + cos² = 1)
+```
+
+Thus `‖R(θ)·v‖ = ‖v‖`. (Test: `rotation_keeps_the_length`.) More generally,
+`R` keeps dot products, so it also keeps the angles between vectors. (Test:
+`rotation_keeps_dot_products`.)
+
+**(3) It does not reflect.**
+`det(R(θ)) = cos θ·cos θ − (−sin θ)·sin θ = cos²θ + sin²θ = 1`. The
+determinant is positive, so there is no reflection. It is 1, so areas do
+not change. (Test: `rotation_matrix_has_determinant_one`.) A reflection,
+for example `[[1, 0], [0, −1]]`, also keeps lengths, but its determinant is
+`−1`.
+
+### 3.8 Rotations at the four quarter turns
+
+Put `cos` and `sin` of each angle into `R(θ)`:
+
+| θ | `cos θ` | `sin θ` | `R(θ)` | `[x, y]` goes to | `[2, 3]` goes to |
+|---|---|---|---|---|---|
+| 0 | 1 | 0 | `[[1, 0], [0, 1]]` | `[x, y]` | `[2, 3]` |
+| π/2 | 0 | 1 | `[[0, −1], [1, 0]]` | `[−y, x]` | `[−3, 2]` |
+| π | −1 | 0 | `[[−1, 0], [0, −1]]` | `[−x, −y]` | `[−2, −3]` |
+| 3π/2 | 0 | −1 | `[[0, 1], [−1, 0]]` | `[y, −x]` | `[3, −2]` |
+
+Compare `R(π/2)` with Entry 3: multiplication by `i` changes `x + yi` into
+`−y + xi`. This is the same transformation.
+
+### 3.9 Properties of rotation matrices
+
+**Composition.** Two rotations, one after the other, are one rotation by the
+sum of the angles:
+
+```text
+R(α)·R(β) = R(α + β)
+```
+
+Proof: multiply the matrices (3.3) and use the angle-addition formulas.
+Element (1,1): `cos α·cos β − sin α·sin β = cos(α + β)`. The other three
+elements are similar. (Test: `rotations_compose_by_adding_angles`.)
+
+**The inverse is the transpose.**
+
+```text
+R(θ)ᵀ = [  cos θ   sin θ ] = [ cos(−θ)  −sin(−θ) ] = R(−θ)
+        [ −sin θ   cos θ ]   [ sin(−θ)   cos(−θ) ]
+```
+
+We used `cos(−θ) = cos θ` and `sin(−θ) = −sin θ` (Entry 4). Thus
+`R(θ)ᵀ·R(θ) = R(−θ + θ) = R(0) = I`. A matrix with `Mᵀ·M = I` is
+**orthogonal**. (Tests: `transpose_is_the_inverse_rotation`,
+`rotation_matrix_is_orthogonal`.)
+
+**The relative-rotation identity.** Combine the two results:
+
+```text
+R(α)ᵀ·R(β) = R(−α)·R(β) = R(β − α)
+```
+
+(Test: `relative_rotation_identity`.) This identity is the mathematical
+heart of RoPE.
+
+### 3.10 Preview: how RoPE uses this (not implemented)
+
+Let `q` be a query vector of a token at position `m`, and `k` a key vector
+of a token at position `n`. For one pair of dimensions, RoPE calculates
+`R(m·θ)·q` and `R(n·θ)·k`. Attention takes the dot product. A dot product
+can be written as `uᵀ·w`. Thus:
+
+```text
+(R(mθ)·q)ᵀ · (R(nθ)·k) = qᵀ · R(mθ)ᵀ · R(nθ) · k = qᵀ · R((n − m)θ) · k
+```
+
+(We used `(A·q)ᵀ = qᵀ·Aᵀ`.) The result depends only on the **difference**
+`n − m` of the positions, not on `m` and `n` separately. This is why RoPE
+gives relative position information to attention.
+
+For a full vector with `d` dimensions, RoPE uses a **block-diagonal**
+matrix: `d/2` rotation blocks on the diagonal, each with its own frequency
+`θᵢ`, and zeros everywhere else:
+
+```text
+[ R(mθ₀)    0     ...        0          ]
+[   0     R(mθ₁)  ...        0          ]
+[  ...     ...    ...       ...         ]
+[   0       0     ...  R(mθ_{d/2−1})    ]
+```
+
+Each pair is rotated independently. The real implementation never builds
+this large matrix. It rotates each pair directly, with 4 multiplications
+and 2 additions. Stage 3 derives the frequencies `θᵢ`. Stage 4 implements
+the pairwise rotation.
+
+### 3.11 Floating-point errors in rotations
+
+The test `quarter_turn_result_is_not_exact` shows:
+
+```text
+rotate_vector([1, 0], π/2) = [6.123233995736766e-17, 1.0]
+```
+
+The exact result is `[0, 1]`. The `x` component is
+`1·cos(π/2) − 0·sin(π/2) = cos(PI/2)`. As Entry 4 explains, `PI/2` is not
+exactly `π/2`, so `cos(PI/2) = 6.1e-17`. The `y` component is `sin(PI/2)`.
+Near the top of the sine curve, the curve is flat, so the tiny input error
+has no visible effect: the result is exactly `1.0`.
+
+Other sources of error:
+
+- Each multiplication and addition rounds the result (a relative error of
+  up to about `1.1e-16` each).
+- `R(α)·R(β)` and `R(α + β)` are mathematically equal. In `f64` they differ
+  in the last digits, because the rounding steps are different.
+- **Repeated rotations accumulate errors.** If you rotate a vector 1000
+  times by a small angle, the length slowly drifts away from the original
+  length. It is better to calculate one rotation by the total angle. RoPE
+  does exactly this: it calculates `R(m·θ)` directly, not `m` rotations by
+  `θ`.
+
+All tests that compare rotation results use `approx_eq` with the tolerance
+`1e-12`.
+
+## 4. Rust concepts learned
+
+### 4.1 Type aliases
+
+```rust
+pub type Vector2 = [f64; 2];
+```
+
+A **type alias** gives a new name to an existing type. It does **not**
+create a new type. `Vector2` and `[f64; 2]` are fully interchangeable. The
+alias makes the signatures readable: `fn rotate_vector(v: Vector2, ...)`.
+
+Compare with a **newtype** (`struct Vector2([f64; 2])`). A newtype is a new,
+different type. It can have its own methods and trait implementations, but
+the caller must wrap and unwrap the values. We do not need methods on
+`Vector2` (the operations are on `Matrix2`), so the alias is sufficient.
+
+### 4.2 Nested arrays and their layout
+
+`Matrix2` stores `[[f64; 2]; 2]`: an array of 2 rows, each an array of 2
+`f64` values. In memory, this is 4 contiguous `f64` values (32 bytes) in the
+order `m₁₁, m₁₂, m₂₁, m₂₂`. This is **row-major order**.
+
+```text
+offset:  0       8       16      24
+        ┌───────┬───────┬───────┬───────┐
+        │  m11  │  m12  │  m21  │  m22  │
+        └───────┴───────┴───────┴───────┘
+           row 0           row 1
+```
+
+There are no pointers and no heap. `Matrix2` is `Copy`.
+
+### 4.3 Destructuring patterns for arrays
+
+```rust
+let [[a, b], [c, d]] = self.rows;
+let [x, y] = v;
+```
+
+A **pattern** on the left of `let` unpacks the value. The compiler checks
+that the pattern matches the type exactly. `[[a, b], [c, d]]` matches only a
+2 × 2 array. There is no runtime check, and no possible out-of-bounds
+access. Then the code uses the same letters as the equations:
+`[a * x + b * y, c * x + d * y]`.
+
+### 4.4 `const fn` with arrays
+
+`Matrix2::new`, `from_rows`, `rows`, `get` and `transpose` are `const fn`.
+Thus `Matrix2::IDENTITY` is a compile-time constant. `rotation` cannot be
+`const`, because `sin_cos` is not `const`.
+
+`get` uses array indexing `self.rows[row][col]`. Array indexing checks the
+bounds at run time and **panics** if the index is too large. The test
+`get_out_of_range_panics` uses `#[should_panic]`: the test passes only if
+the code panics.
+
+**Why panic here and `Result` for `Vector`?** For `Vector`, the dimensions
+come from the caller's data and can be wrong at run time. For `Matrix2`, the
+valid indices are always 0 and 1. A wrong index is a bug in the caller's
+code, not a data problem. `CLAUDE.md` section 6 says: "Use `panic!` only for
+internal logic errors (bugs)". The documentation of `get` has a `# Panics`
+section for this reason.
+
+### 4.5 Methods that take `self` by value (again)
+
+All `Matrix2` methods take `self`, not `&self`. `Matrix2` is 32 bytes and
+`Copy`. In optimized builds, the compiler keeps the values in registers and
+inlines the methods. The caller can still use the matrix after the call.
+
+### 4.6 Named methods instead of the `*` operator
+
+We named the products `mul_vector` and `mul_matrix`. We could implement
+`Mul<Vector2> for Matrix2` and `Mul<Matrix2> for Matrix2`. Rust permits
+this, because `Matrix2` is our own type. But:
+
+- Two different products behind one symbol `*` are harder to read for a
+  learner.
+- The method names say exactly which product happens.
+
+This is a style choice. Section 7 lists the alternative.
+
+### 4.7 Module dependencies inside `math`
+
+```rust
+use crate::math::trigonometry::sin_cos;
+```
+
+`crate::` starts the path at the root of our library. `matrix` uses
+`trigonometry`. Both are inside `math`. The architecture rule (`math` must
+not use `rope`) is still kept.
+
+### 4.8 Closures in tests
+
+```rust
+let dot = |u: Vector2, w: Vector2| Vector::from_slice(&u).dot(&Vector::from_slice(&w));
+```
+
+A **closure** is an anonymous function that you can store in a variable.
+Here it reuses the `Vector` dot product (Entry 2) for `Vector2` values.
+This avoids a second dot-product implementation. In a test, the two heap
+allocations of `from_slice` do not matter.
+
+## 5. Memory and execution
+
+**Execution of `rotate_vector([2.0, 3.0], θ)`:**
+
+1. The caller copies the array `[2.0, 3.0]` (16 bytes) into the parameter
+   `v`. `Vector2` is `Copy`, so the caller keeps its own copy.
+2. `Matrix2::rotation(θ)` calls `sin_cos(θ)`. It returns `(sin, cos)` in
+   registers.
+3. It builds a `Matrix2` value (32 bytes) on the stack or in registers.
+4. `mul_vector` copies the matrix (by value), destructures it, and
+   calculates 4 multiplications and 2 additions.
+5. It returns a new `[f64; 2]`. The temporary matrix goes out of scope.
+   Nothing is freed, because there is no heap memory.
+
+In an optimized build, the compiler usually inlines all of this. The result
+is a call to the sine/cosine routine, then 6 arithmetic instructions. There
+is no allocation.
+
+**Memory summary:**
+
+| Value | Size | Location | `Copy` |
+|---|---|---|---|
+| `Vector2` | 16 bytes | inline (stack/registers) | yes |
+| `Matrix2` | 32 bytes | inline (stack/registers) | yes |
+| `Vector` (Entry 2) | 24 bytes + 8·n heap | stack + heap | no |
+
+**Ownership:** all types in this component are `Copy`. Thus values are
+copied, never moved, and nothing is borrowed.
+
+## 6. Engineering decisions
+
+1. **Fixed-size types for 2-D.** RoPE always rotates **pairs**. The size 2 is
+   known at compile time. `[f64; 2]` and `[[f64; 2]; 2]` give zero heap
+   allocation and compile-time dimension checks.
+2. **A type alias, not a newtype, for `Vector2`.** No extra methods are
+   needed. The alias keeps the call syntax simple:
+   `rotate_vector([1.0, 0.0], θ)`.
+3. **Row-major storage.** It matches the way we write matrices on paper and
+   the order of the arguments in `Matrix2::new`.
+4. **Explicit formulas instead of loops.** For a 2 × 2 matrix, four explicit
+   expressions are clearer than three nested loops, and they match the
+   equations letter by letter.
+5. **No duplicate norm or dot product.** The tests use `Vector` for these.
+6. **`transpose` and `determinant` are included.** They are not in the task
+   list. We added them because they are necessary to *prove* the rotation
+   properties in tests (orthogonality, no reflection), and the
+   relative-rotation identity uses the transpose. They are small.
+7. **`rotate_vector` builds the matrix.** A direct formula
+   (`[x·c − y·s, x·s + y·c]`) is equivalent. Building the matrix shows the
+   link between the mathematics and the code. In optimized builds, the
+   compiler produces the same machine code.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `impl Mul for Matrix2` (`m * n`, `m * v`) | Short, mathematical syntax | Two products behind one symbol. Less explicit for learners |
+| Column-major storage | The convention of Fortran, BLAS and many GPU libraries | Different from the paper order. No benefit for 2 × 2 |
+| Generic `Matrix<const R: usize, const C: usize>` | All sizes with one type | More complex code. RoPE needs only 2 × 2 |
+| Store only `(cos θ, sin θ)` for rotations | 16 bytes instead of 32. RoPE implementations do this | A separate type for rotations. We prefer to show the full matrix first |
+| `nalgebra` or `glam` crate | Complete, fast, SIMD | Hides the concepts. Adds a dependency |
+| Rotate with complex multiplication | Same result (Entry 6) | A different view. We implement both to compare them |
+
+## 8. Performance considerations
+
+| Operation | Multiplications | Additions | Other |
+|---|---|---|---|
+| `mul_vector` | 4 | 2 | — |
+| `mul_matrix` | 8 | 4 | — |
+| `transpose` | 0 | 0 | copies values |
+| `determinant` | 2 | 1 | — |
+| `rotation(θ)` | 0 | 0 | 1 `sin_cos` call (expensive) |
+| `rotate_vector` | 4 | 2 | 1 `sin_cos` call |
+
+- Every operation is O(1). No allocation.
+- **The expensive part is `sin_cos`**, not the arithmetic. If many vectors
+  are rotated by the same angle, calculate `R(θ)` one time and reuse it. In
+  RoPE, the angle `m·θᵢ` is the same for every vector at position `m`, so a
+  precomputed table of `cos` and `sin` values is the standard optimization
+  (Stage 3/6).
+- **A full block-diagonal `d × d` matrix would be very wasteful.** It has
+  `d²` elements, but only `2d` of them are not zero. The matrix-vector
+  product would need `d²` multiplications. The pairwise rotation needs only
+  `2d` multiplications. For `d = 128`, this is 16 384 versus 256.
+- **SIMD.** The pairwise rotation applies the same 6 operations to many
+  independent pairs. This pattern is ideal for SIMD (Stage 6).
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::matrix::{rotate_vector, Matrix2};
+use std::f64::consts::{FRAC_PI_2, PI};
+
+let m = Matrix2::new(1.0, 2.0, 3.0, 4.0);
+println!("{:?}", m.mul_vector([5.0, 6.0]));
+println!("{:?}", m.mul_matrix(Matrix2::new(5.0, 6.0, 7.0, 8.0)).rows());
+
+for theta in [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2] {
+    let [x, y] = rotate_vector([1.0, 0.0], theta);
+    println!("θ = {theta:.4}: ({x:e}, {y:e})");
+}
+```
+
+Expected output:
+
+```text
+[17.0, 39.0]
+[[19.0, 22.0], [43.0, 50.0]]
+θ = 0.0000: (1e0, 0e0)
+θ = 1.5708: (6.123233995736766e-17, 1e0)
+θ = 3.1416: (-1e0, 1.2246467991473532e-16)
+θ = 4.7124: (-1.8369701987210297e-16, -1e0)
+```
+
+The small values (`6.1e-17` and others) are the mathematical zeros, with
+the rounding error of section 3.11.
+
+## 10. What we learned
+
+**Mathematics:**
+
+- A matrix is a linear transformation. Its columns are the images of the
+  axis vectors.
+- Matrix-vector and matrix-matrix products are row-times-column dot
+  products. `M·N` means "first `N`, then `M`". In general `M·N ≠ N·M`.
+- We derived `R(θ) = [[cos θ, −sin θ], [sin θ, cos θ]]` in two ways: from
+  the images of the axis vectors, and from polar coordinates with the
+  angle-addition formulas.
+- `R(θ)` is a rotation: it fixes the origin, keeps lengths (proof with
+  `sin² + cos² = 1`) and has determinant 1 (no reflection).
+- `R(α)R(β) = R(α + β)`, `R(θ)ᵀ = R(−θ)`, and `R(α)ᵀR(β) = R(β − α)`. The
+  last identity is the reason that RoPE encodes relative positions.
+- RoPE applies one 2-D rotation to each pair of dimensions. It never builds
+  the full `d × d` matrix.
+
+**Rust:**
+
+- Type aliases (`type Vector2 = [f64; 2]`) versus newtypes.
+- Nested fixed-size arrays: inline, contiguous, row-major, `Copy`.
+- Array destructuring patterns: checked at compile time, no bounds checks.
+- `#[should_panic]` tests, and when `panic!` is correct (caller bugs with
+  fixed indices) versus `Result` (data problems).
+- `crate::` paths for dependencies between modules.
+
+
+---
+
+# Entry 6 — Euler's formula and rotation by complex multiplication (Stage 2, Component 5)
+
+**Date:** 2026-10-31
+**Stage:** 2 (Mathematical foundations)
+**Files:** `src/math/complex.rs` (`from_polar`, `rotate`),
+`tests/numerical_tests.rs`, `examples/math_foundations.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `Complex::from_polar(r, φ)` = `r·e^(iφ)` | ✅ Implemented |
+| `Complex::rotate(θ)` = `z·e^(iθ)` | ✅ Implemented |
+| Integration tests: complex rotation = matrix rotation, relative-position property | ✅ Implemented |
+| Example program `examples/math_foundations.rs` | ✅ Implemented |
+| A general complex exponential `exp(a + bi)` | ❌ Not implemented. See section 6. |
+| RoPE with complex numbers | ⏳ Planned (Stages 3–4) |
+
+---
+
+## 1. What did we build?
+
+We added two functions to `Complex`:
+
+- `Complex::from_polar(r, φ)` creates the complex number with magnitude `r`
+  and phase `φ`: `r·(cos φ + i·sin φ)`. With `r = 1`, this is `e^(iφ)`.
+- `z.rotate(θ)` rotates `z` by the angle `θ`. It multiplies `z` by `e^(iθ)`.
+
+We also added integration tests that connect all Stage 2 modules, and an
+example program that prints all numerical examples of Entries 2–6.
+
+## 2. Why did we build it?
+
+Entry 5 showed rotation with a matrix. This entry shows the same rotation
+with complex multiplication. Both views are important:
+
+- The RoFormer paper (Su et al., 2021) **derives** RoPE with complex
+  numbers. The proof of the relative-position property is very short in
+  complex form.
+- Many implementations (for example the original LLaMA code) **calculate**
+  RoPE with complex numbers: they view each pair `(x, y)` as `x + iy` and
+  multiply it by `e^(i·m·θⱼ)`.
+
+If we understand that both views give the same result, we can read any RoPE
+implementation.
+
+## 3. Mathematical foundation
+
+### 3.1 The exponential function `e^x`
+
+`e ≈ 2.71828` is a mathematical constant (Euler's number). The function
+`e^x` grows at a rate equal to its own value: its derivative is `e^x`.
+
+`e^x` has a **power series** (Taylor series): an infinite sum of powers of
+`x`. It is correct for every real number `x`:
+
+```text
+e^x = 1 + x + x²/2! + x³/3! + x⁴/4! + x⁵/5! + ...
+```
+
+`n!` (read "n factorial") is the product `1·2·3·…·n`. Examples: `2! = 2`,
+`3! = 6`, `4! = 24`, `5! = 120`.
+
+Sine and cosine also have power series (for `θ` in radians; Entry 4,
+section 3.2):
+
+```text
+cos θ = 1 − θ²/2! + θ⁴/4! − θ⁶/6! + ...
+sin θ = θ − θ³/3! + θ⁵/5! − θ⁷/7! + ...
+```
+
+`cos` has only the even powers. `sin` has only the odd powers. The signs
+alternate.
+
+### 3.2 Derivation of Euler's formula
+
+What is `e` to the power of an **imaginary** number `iθ`? Repeated
+multiplication ("`e` times itself `iθ` times") has no meaning. Thus we use
+the power series as the definition, and put `x = iθ` into it.
+
+First, calculate the powers of `i`. They repeat with period 4:
+
+```text
+i⁰ = 1,   i¹ = i,   i² = −1,   i³ = i²·i = −i,   i⁴ = i²·i² = 1,   i⁵ = i, ...
+```
+
+Now put `x = iθ` into the series. Use `(iθ)ⁿ = iⁿ·θⁿ`:
+
+```text
+e^(iθ) = 1 + iθ + (iθ)²/2! + (iθ)³/3! + (iθ)⁴/4! + (iθ)⁵/5! + ...
+       = 1 + iθ −   θ²/2!  − i·θ³/3! +   θ⁴/4!  + i·θ⁵/5! − ...
+```
+
+Collect the terms without `i` and the terms with `i`:
+
+```text
+e^(iθ) = (1 − θ²/2! + θ⁴/4! − ...)  +  i·(θ − θ³/3! + θ⁵/5! − ...)
+       =          cos θ             +  i·          sin θ
+```
+
+This is **Euler's formula**:
+
+```text
+e^(iθ) = cos θ + i·sin θ
+```
+
+- `e` is Euler's number.
+- `i` is the imaginary unit (`i² = −1`).
+- `θ` is a real number: an angle in radians.
+
+**Geometric interpretation.** `e^(iθ)` is the complex number with real part
+`cos θ` and imaginary part `sin θ`. This is the point `(cos θ, sin θ)` on the
+**unit circle** (Entry 4). Its magnitude is `√(cos²θ + sin²θ) = 1`, and its
+phase is `θ`.
+
+**Values at the four quarter turns:**
+
+| θ | `e^(iθ)` | point |
+|---|---|---|
+| 0 | `1` | (1, 0) |
+| π/2 | `i` | (0, 1) |
+| π | `−1` | (−1, 0) |
+| 3π/2 | `−i` | (0, −1) |
+
+The row `θ = π` gives **Euler's identity**: `e^(iπ) + 1 = 0`. (Test:
+`eulers_identity`.)
+
+### 3.3 The polar form of a complex number
+
+Every complex number `z = a + bi` has a magnitude `r = |z|` and a phase
+`φ = arg(z)` (Entry 3). From the unit circle, `a = r·cos φ` and
+`b = r·sin φ`. Thus:
+
+```text
+z = r·cos φ + i·r·sin φ = r·(cos φ + i·sin φ) = r·e^(iφ)
+```
+
+This is the **polar form**. `from_polar(r, φ)` implements it. `magnitude`
+and `phase` go in the opposite direction. (Test: `polar_round_trip`.)
+
+### 3.4 Why multiplication by `e^(iθ)` rotates
+
+Multiply `z = r·e^(iφ)` by `e^(iθ)`. The exponent rule `e^x·e^y = e^(x+y)`
+is also correct for complex exponents (it follows from the power series).
+Thus:
+
+```text
+z·e^(iθ) = r·e^(iφ)·e^(iθ) = r·e^(i(φ + θ))
+```
+
+The result has:
+
+- the **same magnitude** `r`, and
+- the phase `φ + θ`: **the angle increased by `θ`**.
+
+This is exactly a rotation by `θ` around the origin. Entry 3 found the same
+rule from the other direction: multiplication multiplies the magnitudes
+(`r · 1 = r`) and adds the phases (`φ + θ`).
+
+### 3.5 The link to the rotation matrix
+
+Calculate the product in components. Let `z = x + iy` and
+`e^(iθ) = cos θ + i·sin θ`. With the multiplication formula of Entry 3
+(`a = x`, `b = y`, `c = cos θ`, `d = sin θ`):
+
+```text
+(x + iy)(cos θ + i·sin θ) = (x·cos θ − y·sin θ) + i·(x·sin θ + y·cos θ)
+```
+
+Compare with the rotation matrix of Entry 5:
+
+```text
+[ cos θ  −sin θ ] [ x ]   [ x·cos θ − y·sin θ ]
+[ sin θ   cos θ ] [ y ] = [ x·sin θ + y·cos θ ]
+```
+
+**The real part is `x'` and the imaginary part is `y'`. The results are
+identical.** The integration test `complex_rotation_equals_matrix_rotation`
+checks this for 9 angles and 6 vectors.
+
+More generally: multiplication by any complex number `c + di` is the same as
+multiplication by the matrix `[[c, −d], [d, c]]`. For `c + di = e^(iθ)`, this
+matrix is `R(θ)`.
+
+### 3.6 Properties in complex form
+
+All the rotation properties of Entry 5 have a short complex form:
+
+| Property | Matrix form (Entry 5) | Complex form |
+|---|---|---|
+| Composition | `R(α)·R(β) = R(α + β)` | `e^(iα)·e^(iβ) = e^(i(α + β))` |
+| Inverse | `R(θ)ᵀ = R(−θ)` | `conj(e^(iθ)) = e^(−iθ)` |
+| Length | `‖R(θ)·v‖ = ‖v‖` | `|z·e^(iθ)| = |z|` |
+| Repetition | `R(θ)ⁿ = R(nθ)` | `(e^(iθ))ⁿ = e^(inθ)` (de Moivre's formula) |
+
+**The conjugate reverses the rotation.**
+`conj(cos θ + i·sin θ) = cos θ − i·sin θ = cos(−θ) + i·sin(−θ) = e^(−iθ)`.
+(Test: `conjugate_reverses_a_rotation`.)
+
+### 3.7 The relative-position property in complex form
+
+This is the derivation of the RoFormer paper, for one pair of dimensions.
+
+First, a fact: the 2-D dot product equals the real part of a product with a
+conjugate. Let `u = a + bi` and `w = c + di`:
+
+```text
+u·conj(w) = (a + bi)(c − di) = (ac + bd) + (bc − ad)i
+Re[u·conj(w)] = ac + bd = [a, b] · [c, d]
+```
+
+Now let `q` be a query at position `m` and `k` a key at position `n`, both
+as complex numbers. RoPE rotates them: `q·e^(imθ)` and `k·e^(inθ)`. The
+attention score is the dot product:
+
+```text
+score = Re[ q·e^(imθ) · conj(k·e^(inθ)) ]
+      = Re[ q·e^(imθ) · conj(k)·e^(−inθ) ]       (conjugate of a product)
+      = Re[ q·conj(k) · e^(i(m − n)θ) ]           (exponent rule)
+```
+
+The score depends on `m` and `n` **only through `m − n`**. (Tests:
+`relative_rotation_property` in `complex.rs`, and the two
+`relative_position_property_*` tests in `tests/numerical_tests.rs`.)
+
+**Numerical example.** `θ = 0.37`, `q = [0.8, −1.1]`, `k = [−0.3, 1.9]`.
+The pairs of positions `(m, n) = (0, 3), (1, 4), (10, 13), (100, 103)` all
+have `n − m = 3`. They all give the same score (within `1e-12`). The pair
+`(0, 4)` has a different distance and gives a different score.
+
+The matrix form (Entry 5, section 3.10) gave the same result:
+`qᵀ·R((n − m)θ)·k`. The complex and matrix derivations are two views of one
+fact.
+
+### 3.8 Numerical examples
+
+**Example 1: Euler's identity.**
+
+```text
+from_polar(1, π) = cos(π) + i·sin(π) = −1 + 0i        (exact mathematics)
+                 = −1 + 1.2246467991473532e-16·i       (f64)
+```
+
+The imaginary part is `sin(PI)`, which is not zero (Entry 4, section 3.8).
+
+**Example 2: rotation of `1 + i` by `π/4`.**
+
+```text
+1 + i:   magnitude √2 ≈ 1.41421,   phase π/4 ≈ 0.78540
+(1 + i)·e^(iπ/4) = (1 + i)(√2/2 + i·√2/2)
+                 = (√2/2 − √2/2) + i·(√2/2 + √2/2)
+                 = 0 + i·√2
+result:  magnitude √2,   phase π/2 ≈ 1.57080
+```
+
+The magnitude stays the same. The phase increases by `π/4`.
+
+**Example 3: complex and matrix rotation of `[2, 3]` by `θ = 0.5`.**
+`cos(0.5) ≈ 0.877583`, `sin(0.5) ≈ 0.479426`.
+
+```text
+x' = 2·0.877583 − 3·0.479426 ≈ 0.316889
+y' = 2·0.479426 + 3·0.877583 ≈ 3.591599
+```
+
+The program prints both results with 15 decimals. They are bit-for-bit
+equal: `(0.316888507968137, 3.591598762879524)`. The two methods do the same
+arithmetic operations in the same order.
+
+### 3.9 Precision considerations
+
+- `from_polar(1, θ)` has magnitude 1 only up to rounding. `cos²θ + sin²θ`
+  in `f64` differs from 1 by a few `f64::EPSILON`. (Test:
+  `unit_complex_numbers_have_magnitude_one`.)
+- **De Moivre in `f64`.** Five multiplications `w·w·w·w·w` and one
+  `from_polar(1, 5θ)` agree within `1e-12`, but not exactly. Each
+  multiplication adds rounding errors. (Test: `de_moivre_formula`.)
+- **Accumulated drift.** The integration test
+  `many_small_rotations_drift_more_than_one_large_rotation` rotates `[1, 0]`
+  10 000 times by `0.001`. We measured on this computer: the length error
+  after 10 000 steps is `7.8e-14` (about 350 × `f64::EPSILON`). One rotation
+  by `10.0` has a length error of exactly 0. **Conclusion for RoPE:**
+  calculate `e^(i·m·θ)` directly from the angle `m·θ`. Do not calculate it as
+  `(e^(iθ))ᵐ` with repeated multiplication.
+- Large angles `m·θ` have a large absolute error in `f64` (Entry 4,
+  section 3.8). This affects `from_polar` in the same way as `sin_cos`.
+
+## 4. Rust concepts learned
+
+### 4.1 Reuse of an operator trait inside a method
+
+```rust
+pub fn rotate(self, theta: f64) -> Self {
+    self * Self::from_polar(1.0, theta)
+}
+```
+
+`rotate` uses the `Mul` implementation of Entry 3. The expression
+`self * ...` calls `<Complex as Mul>::mul`. We do not duplicate the
+multiplication formula. If the formula had a bug, there would be only one
+place to correct it.
+
+`Self::from_polar` calls an associated function of the same type. `Self` is
+`Complex` here.
+
+### 4.2 Shared helpers across modules
+
+`from_polar` uses `sin_cos` from `trigonometry`, the same as
+`Matrix2::rotation`. Thus both rotation methods use the same sine and cosine
+values. This is one reason that the complex and the matrix results are
+bit-for-bit equal in the example.
+
+### 4.3 Integration tests (`tests/*.rs`)
+
+`tests/numerical_tests.rs` is a **separate crate**. It can use only the
+public items of the library:
+
+```rust
+use rust_rope::math::complex::Complex;
+use rust_rope::math::matrix::{Matrix2, Vector, Vector2, rotate_vector};
+```
+
+If a test in this file needs a private item, the test does not compile.
+This tests the **public API** from the view of a user. Unit tests (inside
+`#[cfg(test)]` modules) test the internal details.
+
+### 4.4 `const` arrays of test data
+
+```rust
+const ANGLES: [f64; 9] = [-5.0, -1.0, ...];
+const VECTORS: [Vector2; 6] = [[0.0, 0.0], ...];
+```
+
+A `const` item is a compile-time value. The compiler puts a copy of it into
+each place that uses it. The size is part of the type (`[f64; 9]`), so the
+array cannot have a wrong length. We loop over these arrays: `for theta in
+ANGLES`. In Rust 2021 and later, `for x in array` iterates over the values
+of the array (not references).
+
+### 4.5 `expect` versus `unwrap`
+
+```rust
+.dot(&Vector::from_slice(&b)).expect("2-D vectors always have the same dimension")
+```
+
+`expect(msg)` is like `unwrap()`: it returns the `Ok` value, or panics if
+the result is `Err`. The message documents **why** we know that the error
+cannot happen. If the code is changed later and the error happens, the
+panic message explains the broken assumption.
+
+### 4.6 Closures that capture variables
+
+```rust
+let score = |m: f64, n: f64| dot(rotate_vector(q, m * theta), rotate_vector(k, n * theta));
+```
+
+The closure uses `q`, `k` and `theta` from the surrounding function. It
+**captures** them. `q`, `k` and `theta` are `Copy`, and the closure only
+reads them, so it captures them by reference. The closure cannot outlive
+these variables; the compiler checks this.
+
+### 4.7 Examples (`examples/*.rs`)
+
+`examples/math_foundations.rs` is also a separate crate with a `main`
+function. `cargo run --example math_foundations` builds and runs it.
+`cargo test` compiles all examples, so an example that does not compile
+makes the test command fail. This keeps the examples correct.
+
+## 5. Memory and execution
+
+**Execution of `z.rotate(θ)`:**
+
+1. `z` (16 bytes) is copied into `self`.
+2. `from_polar(1.0, θ)` calls `sin_cos(θ)` and creates a `Complex` with
+   `1.0·cos θ` and `1.0·sin θ`. (The compiler can remove the multiplication
+   by `1.0` because `1.0·x = x` exactly in IEEE 754.)
+3. `self * w` calculates 4 multiplications and 2 additions.
+4. The result is returned in registers.
+
+No heap allocation. No borrowing. All values are `Copy`.
+
+**Comparison of the two rotation methods:**
+
+| | `rotate_vector(v, θ)` (Entry 5) | `z.rotate(θ)` (this entry) |
+|---|---|---|
+| Input type | `[f64; 2]` | `Complex` |
+| Intermediate value | `Matrix2` (32 bytes) | `Complex` (16 bytes) |
+| `sin_cos` calls | 1 | 1 |
+| Arithmetic | 4 mul + 2 add | 4 mul + 2 add |
+| Heap | none | none |
+
+After inlining and optimization, both produce practically the same machine
+code.
+
+## 6. Engineering decisions
+
+1. **No general complex exponential `exp(a + bi)`.** The task says: add it
+   only if it is useful for learning. RoPE needs only `e^(iθ)` for real `θ`.
+   `exp(a + bi) = e^a·e^(ib)` would be one more line, but no later stage uses
+   it. `from_polar(1.0, θ)` is `e^(iθ)` exactly. The name `from_polar` is
+   the standard name for this operation (the C++ standard library and the
+   Rust crate `num-complex` use it too).
+2. **`rotate` is a method that returns a new value.** `Complex` is `Copy`, so
+   a new value is cheap. An in-place version (`&mut self`) would give no
+   benefit.
+3. **`rotate` reuses `Mul`.** One multiplication formula in the code.
+4. **Integration tests for the cross-module properties.** The fact
+   "complex rotation = matrix rotation" belongs to neither module alone. It
+   is a property of the public API, so it is in `tests/`.
+5. **A new example file.** The task structure lists only
+   `examples/basic_rope.rs`, which is for RoPE (Stage 4). We added
+   `examples/math_foundations.rs` so that the expected outputs in
+   `explain.md` can be checked by running one command. All outputs in
+   Entries 2–6 come from this program.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `Complex::exp(self)` for any complex number | General, mathematically complete | Not needed. Speculative |
+| `Complex::cis(θ)` ("cos + i sin") | Short, a known name | Less common in Rust. `from_polar(1.0, θ)` is clearer |
+| Rotation via `Matrix2` only | One method | The RoFormer derivation and many implementations use complex form |
+| Rotation by repeated multiplication `wᵐ` | Avoids `sin_cos` per position | Accumulates errors (section 3.9). Slower for large `m` unless done by squaring |
+| A lookup table of `e^(i·m·θ)` | Fast for many tokens | Needs memory. Planned as the RoPE cache in Stage 3/6 |
+
+## 8. Performance considerations
+
+- `from_polar`: one `sin_cos` call and 2 multiplications. O(1).
+- `rotate`: one `sin_cos` call, 4 multiplications, 2 additions. O(1).
+- The cost is dominated by `sin_cos` (about 20 to 100 cycles), not by the
+  arithmetic (about 6 cycles or less).
+- **Implication for RoPE.** For a sequence of `L` tokens and `d/2` pairs,
+  RoPE needs `L·d/2` values `e^(i·m·θⱼ)`. They do not depend on the input
+  data. Calculate them one time and store them (a table of `L·d/2` complex
+  numbers = `L·d/2·16` bytes in `f64`). Then each rotation is only 4
+  multiplications and 2 additions. Stage 3 plans this.
+- **Memory layout.** An array of `Complex` stores `re, im, re, im, ...`.
+  This is the "interleaved" layout. Stage 4 compares it with the
+  "split-half" layout that some models use.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::complex::Complex;
+use rust_rope::math::matrix::rotate_vector;
+use std::f64::consts::{FRAC_PI_4, PI};
+
+let e_i_pi = Complex::from_polar(1.0, PI);
+println!("e^(iπ)          = {e_i_pi:?}");
+
+let z = Complex::new(1.0, 1.0);
+let rotated = z.rotate(FRAC_PI_4);
+println!("(1 + i)·e^(iπ/4) = {rotated:?}");
+println!("magnitude {} -> {}, phase {} -> {}",
+         z.magnitude(), rotated.magnitude(), z.phase(), rotated.phase());
+
+let by_complex = Complex::new(2.0, 3.0).rotate(0.5);
+let by_matrix = rotate_vector([2.0, 3.0], 0.5);
+println!("complex: ({:.15}, {:.15})", by_complex.re(), by_complex.im());
+println!("matrix:  ({:.15}, {:.15})", by_matrix[0], by_matrix[1]);
+```
+
+Expected output (from `cargo run --example math_foundations`):
+
+```text
+e^(iπ)          = Complex { re: -1.0, im: 1.2246467991473532e-16 }
+(1 + i)·e^(iπ/4) = Complex { re: 0.0, im: 1.4142135623730951 }
+magnitude 1.4142135623730951 -> 1.4142135623730951, phase 0.7853981633974483 -> 1.5707963267948966
+complex: (0.316888507968137, 3.591598762879524)
+matrix:  (0.316888507968137, 3.591598762879524)
+```
+
+Note: the real part of `(1 + i)·e^(iπ/4)` is printed as exactly `0.0`.
+The calculation is `1·cos(π/4) − 1·sin(π/4)`. In `f64`, `cos(π/4)` and
+`sin(π/4)` happen to round to the same value, so the difference is exactly
+zero. This is luck, not a guarantee.
+
+## 10. What we learned
+
+**Mathematics:**
+
+- Euler's formula `e^(iθ) = cos θ + i·sin θ`. We derived it from the power
+  series of `e^x`, `cos θ` and `sin θ`, with the powers of `i`.
+- `e^(iθ)` is the point at angle `θ` on the unit circle. Every complex
+  number is `r·e^(iφ)` (the polar form).
+- Multiplication by `e^(iθ)` keeps the magnitude and adds `θ` to the phase:
+  it is a rotation.
+- In components, `(x + iy)·e^(iθ)` is exactly `R(θ)·[x, y]`.
+- The conjugate reverses the rotation. `Re[u·conj(w)]` is the 2-D dot
+  product.
+- The RoPE score `Re[q·e^(imθ)·conj(k·e^(inθ))] = Re[q·conj(k)·e^(i(m−n)θ)]`
+  depends only on `m − n`.
+- Calculate `e^(i·m·θ)` directly. Repeated multiplication accumulates
+  rounding errors.
+
+**Rust:**
+
+- A method can reuse an operator trait implementation (`self * w`).
+- Integration tests are separate crates. They test only the public API.
+- `const` arrays as test data. `for x in array` iterates by value.
+- `expect` documents why an error cannot occur.
+- Closures capture surrounding variables.
+- `cargo test` also compiles the examples.
+
+---
+
+## Roadmap status after Entry 6
+
+Stage 1 and Stage 2 are complete. The roadmap table at the end of Entry 1
+shows the state at that time. This table shows the current state.
+
+| Stage | Status |
+|---|---|
+| 1 Project foundation | ✅ Done (Entry 1) |
+| 2 Mathematical foundations | ✅ Done (Entries 2–6) |
+| 3 RoPE fundamentals | ⏳ Planned (next) |
+| 4 RoPE implementation | ⏳ Planned |
+| 5 Advanced RoPE | ⏳ Planned |
+| 6 Performance engineering | ⏳ Planned |
+| 7 Validation and experimentation | ⏳ Planned |

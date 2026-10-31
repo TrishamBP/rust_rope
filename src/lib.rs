@@ -5,8 +5,12 @@
 //!
 //! ## Status
 //!
-//! Stage 1 (project foundation). The modules exist, but they do not contain
-//! algorithms yet. Each module comment describes its planned responsibility.
+//! Stage 2 (mathematical foundations) is complete.
+//!
+//! - Implemented: [`math`] (vectors, 2 × 2 matrices, rotations, complex
+//!   numbers, Euler's formula, trigonometry, float comparison).
+//! - Planned: [`rope`] (Stages 3–5) and [`utils`] (Stage 3). These modules
+//!   are empty. Each module comment describes its planned responsibility.
 //!
 //! ## Module layout
 //!
