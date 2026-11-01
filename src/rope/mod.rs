@@ -4,14 +4,17 @@
 //! Rotary Position Embeddings. It uses the general primitives in
 //! [`crate::math`].
 //!
-//! ## Status (Stage 3)
+//! ## Status (Stage 8)
 //!
 //! - [`config`]: `RopeConfig` (dimension `d`, base `b`). Implemented.
 //! - [`frequencies`]: inverse frequencies `θⱼ = b^(−2j/d)` and positional
 //!   angles `m · θⱼ` (`AngleTable`). Implemented.
 //! - [`position`]: `Position` and `PositionRange`. Implemented.
-//! - [`rotations`], [`embeddings`]: planned (Stage 4).
-//! - [`scaling`]: planned (Stage 5).
+//! - [`rotations`]: `rotate_pair`. Implemented (Stage 4).
+//! - [`embeddings`]: `RotaryEmbedding` for vectors (Stage 4), query/key
+//!   tensors (Stage 5), layouts and partial RoPE (Stage 7), scaling (Stage 8).
+//! - [`scaling`]: `RopeScaling` (position interpolation, linear, NTK-aware,
+//!   YaRN). Implemented (Stage 8).
 //!
 //! ## Data flow
 //!

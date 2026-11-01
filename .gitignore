@@ -14,3 +14,11 @@
 *.swp
 .DS_Store
 Thumbs.db
+
+# Python virtual environment for the PyTorch reference (Stage 6).
+/reference/.venv/
+__pycache__/
+/reference/data/
+/scripts/.venv/
+ROPE_Engineering.pdf
+explain.md

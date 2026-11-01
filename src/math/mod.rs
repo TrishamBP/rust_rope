@@ -15,13 +15,19 @@
 //! - [`approx_eq`]: tolerance-based comparison of floating-point numbers.
 //!   Implemented.
 //!
+//! ## Status (Stage 5)
+//!
+//! - [`tensor`]: `Tensor4`, a four-dimensional `[B, S, H, D]` array in one
+//!   flat row-major `Vec<f64>`. Implemented.
+//!
 //! ## Dependency order inside `math`
 //!
 //! `trigonometry` depends on nothing. `matrix` and `complex` use
-//! `trigonometry` to calculate sine and cosine.
+//! `trigonometry` to calculate sine and cosine. `tensor` depends on nothing.
 
 pub mod complex;
 pub mod matrix;
+pub mod tensor;
 pub mod trigonometry;
 
 /// The default tolerance for [`approx_eq`].

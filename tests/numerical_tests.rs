@@ -30,8 +30,10 @@ use rust_rope::math::matrix::{Matrix2, Vector, Vector2, rotate_vector};
 use rust_rope::math::trigonometry::unit_circle_point;
 use rust_rope::math::{DEFAULT_TOLERANCE, approx_eq};
 use rust_rope::rope::config::RopeConfig;
+use rust_rope::rope::embeddings::RotaryEmbedding;
 use rust_rope::rope::frequencies::{AngleTable, angle, inverse_frequencies, inverse_frequency};
 use rust_rope::rope::position::{Position, PositionRange};
+use rust_rope::rope::rotations::rotate_pair;
 
 /// A set of angles that covers all four quadrants, negative angles, and a
 /// large angle.
@@ -385,6 +387,568 @@ fn angle_table_defines_rope_rotation_matrices() {
             assert!(
                 matrices_close(relative, r(n - m, j)),
                 "j = {j}, m = {m}, n = {n}"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Stage 4: the RoPE transformation of an embedding vector
+// ===========================================================================
+
+fn rotary(d: usize, b: f64) -> RotaryEmbedding {
+    RotaryEmbedding::new(config(d, b))
+}
+
+/// A deterministic test vector with positive, negative and mixed values.
+fn test_vector(d: usize, seed: f64) -> Vec<f64> {
+    (0..d)
+        .map(|k| 3.0 * (1.3 * k as f64 + seed).sin() - 0.5)
+        .collect()
+}
+
+fn squared_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum()
+}
+
+fn dot_slices(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Invariant A: RoPE(x, 0) = x, exactly.
+#[test]
+fn invariant_a_position_zero_is_the_identity() {
+    for d in [2, 4, 8, 64, 128] {
+        for b in BASES {
+            let x = test_vector(d, 0.5);
+            // cos 0 = 1 and sin 0 = 0 exactly, so x·1 − y·0 = x exactly.
+            assert_eq!(rotary(d, b).rotate(&x, Position::ZERO).unwrap(), x);
+        }
+    }
+}
+
+/// Invariant B: each pair keeps its length; thus the whole vector keeps
+/// its length.
+#[test]
+fn invariant_b_pair_magnitudes_are_preserved() {
+    for d in [2, 8, 128] {
+        let r = rotary(d, 10_000.0);
+        let x = test_vector(d, 1.0);
+        for m in [1, 2, 17, 1000, 1_000_000] {
+            let y = r.rotate(&x, pos(m)).unwrap();
+            for (j, (p, q)) in x.chunks_exact(2).zip(y.chunks_exact(2)).enumerate() {
+                let before = p[0] * p[0] + p[1] * p[1];
+                let after = q[0] * q[0] + q[1] * q[1];
+                assert!(close(before, after), "d = {d}, m = {m}, j = {j}");
+            }
+            assert!(
+                close(squared_norm(&x), squared_norm(&y)),
+                "d = {d}, m = {m}"
+            );
+        }
+    }
+}
+
+/// Invariant C (pair form): R(b)·(R(a)·x) = R(a + b)·x.
+#[test]
+fn invariant_c_pair_rotations_compose() {
+    let p = [1.25, -0.75];
+    for (a, b) in [
+        (0.0, 0.0),
+        (0.3, 0.4),
+        (1.0, -1.0),
+        (2.5, 3.5),
+        (-7.0, 0.01),
+    ] {
+        let twice = rotate_pair(rotate_pair(p, a), b);
+        let once = rotate_pair(p, a + b);
+        assert!(
+            close(twice[0], once[0]) && close(twice[1], once[1]),
+            "a = {a}, b = {b}"
+        );
+    }
+}
+
+/// Invariant C (vector form): RoPE(RoPE(x, m), n) = RoPE(x, m + n), because
+/// every angle is linear in the position: m·θⱼ + n·θⱼ = (m + n)·θⱼ.
+#[test]
+fn invariant_c_embedding_rotations_compose() {
+    let r = rotary(8, 10_000.0);
+    let x = test_vector(8, 2.0);
+    for (m, n) in [(0, 5), (1, 1), (3, 4), (10, 90), (250, 750)] {
+        let twice = r.rotate(&r.rotate(&x, pos(m)).unwrap(), pos(n)).unwrap();
+        let once = r.rotate(&x, pos(m + n)).unwrap();
+        for k in 0..8 {
+            assert!(close(twice[k], once[k]), "m = {m}, n = {n}, k = {k}");
+        }
+    }
+}
+
+/// Invariant D: pair j receives exactly the angle m·θⱼ.
+///
+/// The basis vector e₂ⱼ (1 at index 2j, 0 elsewhere) rotates to
+/// (cos(m·θⱼ), sin(m·θⱼ)) in pair j. Its phase (atan2) is the angle
+/// (reduced to (−π, π]). All other pairs stay exactly zero.
+#[test]
+fn invariant_d_each_pair_gets_its_own_angle() {
+    use std::f64::consts::{PI, TAU};
+    let d = 8;
+    let r = rotary(d, 10_000.0);
+    for j in 0..d / 2 {
+        let mut e = vec![0.0; d];
+        e[2 * j] = 1.0;
+        for m in [1, 2, 3, 7] {
+            let y = r.rotate(&e, pos(m)).unwrap();
+            let expected = m as f64 * r.inverse_frequencies()[j];
+            // Reduce the expected angle to (−π, π], the range of `phase`.
+            let reduced = expected - TAU * ((expected + PI) / TAU).floor();
+            let measured = Complex::new(y[2 * j], y[2 * j + 1]).phase();
+            assert!(
+                close(measured, reduced),
+                "j = {j}, m = {m}: {measured} vs {reduced}"
+            );
+            for (k, &v) in y.iter().enumerate() {
+                if k / 2 != j {
+                    assert_eq!(v, 0.0, "j = {j}, m = {m}, other component {k}");
+                }
+            }
+        }
+    }
+}
+
+/// The complex interpretation: pair j as z = x₂ⱼ + i·x₂ⱼ₊₁, multiplied by
+/// e^(i·m·θⱼ). Same operations in the same order, so bit-for-bit equal.
+#[test]
+fn rope_equals_complex_multiplication_per_pair() {
+    let r = rotary(16, 10_000.0);
+    let x = test_vector(16, 3.0);
+    for m in [0, 1, 5, 123] {
+        let y = r.rotate(&x, pos(m)).unwrap();
+        for (j, &theta) in r.inverse_frequencies().iter().enumerate() {
+            let z = Complex::new(x[2 * j], x[2 * j + 1]).rotate(m as f64 * theta);
+            assert_eq!(
+                [y[2 * j], y[2 * j + 1]],
+                [z.re(), z.im()],
+                "m = {m}, j = {j}"
+            );
+        }
+    }
+}
+
+/// RoPE is a linear map: RoPE(a·u + c·v) = a·RoPE(u) + c·RoPE(v).
+#[test]
+fn rope_is_linear() {
+    let r = rotary(8, 10_000.0);
+    let (u, v) = (test_vector(8, 0.1), test_vector(8, 4.2));
+    let (a, c) = (2.5, -0.75);
+    let mix: Vec<f64> = u.iter().zip(&v).map(|(p, q)| a * p + c * q).collect();
+    for m in [1, 9, 400] {
+        let left = r.rotate(&mix, pos(m)).unwrap();
+        let (ru, rv) = (r.rotate(&u, pos(m)).unwrap(), r.rotate(&v, pos(m)).unwrap());
+        for k in 0..8 {
+            assert!(close(left[k], a * ru[k] + c * rv[k]), "m = {m}, k = {k}");
+        }
+    }
+}
+
+/// The relative-position property for the full vector: the dot product of
+/// RoPE(u, m) and RoPE(v, n) depends only on n − m. (Each pair contributes
+/// uᵀR((n − m)θⱼ)v; the pairs add up.)
+#[test]
+fn full_vector_dot_product_depends_only_on_the_distance() {
+    let r = rotary(16, 10_000.0);
+    let (u, v) = (test_vector(16, 0.7), test_vector(16, -1.9));
+    let score = |m: usize, n: usize| {
+        dot_slices(
+            &r.rotate(&u, pos(m)).unwrap(),
+            &r.rotate(&v, pos(n)).unwrap(),
+        )
+    };
+    let reference = score(0, 6);
+    for (m, n) in [(1, 7), (10, 16), (100, 106), (5000, 5006)] {
+        assert!(close(score(m, n), reference), "m = {m}, n = {n}");
+    }
+    assert!(
+        !close(score(0, 7), reference),
+        "another distance gives another score"
+    );
+}
+
+/// Invariant E: large positions and different bases.
+///
+/// - The length stays correct for every position: a rotation by any angle
+///   keeps the length, and `sin² + cos² = 1` up to a few ε.
+/// - The composition RoPE(RoPE(x, m), n) = RoPE(x, m + n) gets less exact as
+///   m + n grows. The angle m·θ has an absolute rounding error of about
+///   (m + n)·ε. The bound below is 4·ε·(m + n + 10)·max|x|.
+#[test]
+fn invariant_e_large_positions_and_bases() {
+    let x = test_vector(8, 0.3);
+    let max_abs = x.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    for b in [10_000.0, 500_000.0, 1_000_000.0] {
+        let r = rotary(8, b);
+        for m in [1_000, 100_000, 1_000_000, 10_000_000] {
+            let y = r.rotate(&x, pos(m)).unwrap();
+            assert!(y.iter().all(|v| v.is_finite()));
+            assert!(
+                close(squared_norm(&x), squared_norm(&y)),
+                "b = {b}, m = {m}"
+            );
+
+            let n = m / 3;
+            let twice = r.rotate(&y, pos(n)).unwrap();
+            let once = r.rotate(&x, pos(m + n)).unwrap();
+            let bound = 4.0 * f64::EPSILON * (m + n + 10) as f64 * max_abs;
+            for k in 0..8 {
+                let error = (twice[k] - once[k]).abs();
+                assert!(
+                    error <= bound,
+                    "b = {b}, m = {m}, k = {k}: {error:e} > {bound:e}"
+                );
+            }
+        }
+    }
+}
+
+/// The transpose undoes the rotation: rotating pair j back by −m·θⱼ gives x.
+#[test]
+fn rotating_back_by_the_negative_angle_restores_the_input() {
+    let r = rotary(8, 10_000.0);
+    let x = test_vector(8, 5.0);
+    let m = pos(37);
+    let y = r.rotate(&x, m).unwrap();
+    for (j, &theta) in r.inverse_frequencies().iter().enumerate() {
+        let back = rotate_pair([y[2 * j], y[2 * j + 1]], -(m.as_f64() * theta));
+        assert!(
+            close(back[0], x[2 * j]) && close(back[1], x[2 * j + 1]),
+            "j = {j}"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 5: RoPE on query and key tensors [B, S, H, D]
+// ===========================================================================
+
+use rust_rope::math::tensor::{Tensor4, TensorShape};
+
+fn qk_tensor(shape: TensorShape, seed: f64) -> Tensor4 {
+    Tensor4::from_fn(shape, |b, s, h, d| {
+        2.0 * ((b * 7 + s * 5 + h * 3 + d) as f64 * 0.61 + seed).cos()
+    })
+    .unwrap()
+}
+
+/// Test A on tensors: start = 0 and S = 1 means every token is at position
+/// 0, so RoPE is the identity.
+#[test]
+fn tensor_test_a_position_zero_is_the_identity() {
+    let r = rotary(8, 10_000.0);
+    let shape = TensorShape::new(2, 1, 3, 8);
+    let (q, k) = (qk_tensor(shape, 0.0), qk_tensor(shape, 1.0));
+    let (q2, k2) = r.rotate_query_key(&q, &k, Position::ZERO).unwrap();
+    assert_eq!(q2, q);
+    assert_eq!(k2, k);
+}
+
+/// Test B on tensors: every pair of every head vector keeps its length.
+#[test]
+fn tensor_test_b_pair_magnitudes_are_preserved() {
+    let r = rotary(8, 10_000.0);
+    let shape = TensorShape::new(2, 5, 3, 8);
+    let q = qk_tensor(shape, 0.3);
+    let mut q2 = q.clone();
+    r.rotate_tensor_in_place(&mut q2, pos(1000)).unwrap();
+    for (before, after) in q
+        .as_slice()
+        .chunks_exact(2)
+        .zip(q2.as_slice().chunks_exact(2))
+    {
+        let (n0, n1) = (
+            before[0] * before[0] + before[1] * before[1],
+            after[0] * after[0] + after[1] * after[1],
+        );
+        assert!(close(n0, n1));
+    }
+}
+
+/// Test C: (R(m)q)ᵀ(R(n)k) = qᵀ R(n − m) k for every batch element and
+/// head, with query token s_q and key token s_k at positions m and n.
+///
+/// The right side uses `rotate(k, n − m)`: R(n − m)k is exactly RoPE at the
+/// position n − m (for n ≥ m). For n < m, use the equal form
+/// (R(m − n)q)ᵀ k.
+#[test]
+fn tensor_test_c_relative_position_property() {
+    let r = rotary(8, 10_000.0);
+    let shape = TensorShape::new(2, 6, 2, 8);
+    let (q, k) = (qk_tensor(shape, 0.4), qk_tensor(shape, -1.1));
+    let start = 20;
+    let (q2, k2) = r.rotate_query_key(&q, &k, pos(start)).unwrap();
+    for b in 0..2 {
+        for h in 0..2 {
+            for sq in 0..6 {
+                for sk in 0..6 {
+                    let (m, n) = (start + sq, start + sk);
+                    let left =
+                        dot_slices(q2.vector(b, sq, h).unwrap(), k2.vector(b, sk, h).unwrap());
+                    let (qv, kv) = (q.vector(b, sq, h).unwrap(), k.vector(b, sk, h).unwrap());
+                    let right = if n >= m {
+                        dot_slices(qv, &r.rotate(kv, pos(n - m)).unwrap())
+                    } else {
+                        dot_slices(&r.rotate(qv, pos(m - n)).unwrap(), kv)
+                    };
+                    assert!(
+                        close(left, right),
+                        "b={b} h={h} m={m} n={n}: {left} vs {right}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The score depends only on n − m: shifting the start position does not
+/// change any query-key dot product.
+#[test]
+fn tensor_scores_do_not_depend_on_the_start_position() {
+    let r = rotary(16, 10_000.0);
+    let shape = TensorShape::new(1, 4, 2, 16);
+    let (q, k) = (qk_tensor(shape, 0.0), qk_tensor(shape, 2.0));
+    let scores = |start: usize| {
+        let (q2, k2) = r.rotate_query_key(&q, &k, pos(start)).unwrap();
+        let mut out = Vec::new();
+        for h in 0..2 {
+            for sq in 0..4 {
+                for sk in 0..4 {
+                    out.push(dot_slices(
+                        q2.vector(0, sq, h).unwrap(),
+                        k2.vector(0, sk, h).unwrap(),
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let base = scores(0);
+    for start in [1, 100, 10_000] {
+        for (a, b) in base.iter().zip(scores(start)) {
+            assert!(close(*a, b), "start = {start}");
+        }
+    }
+}
+
+/// The 2-D numerical demonstration of explain.md (Entry 12): q = [1, 2],
+/// k = [3, −1], θ = 0.5, m = 2, n = 5.
+#[test]
+fn two_dimensional_relative_position_demonstration() {
+    let theta = 0.5;
+    let (q, k) = ([1.0, 2.0], [3.0, -1.0]);
+    let (m, n) = (2.0, 5.0);
+    let q_rot = rotate_pair(q, m * theta);
+    let k_rot = rotate_pair(k, n * theta);
+    let rotated_score = q_rot[0] * k_rot[0] + q_rot[1] * k_rot[1];
+    let k_rel = rotate_pair(k, (n - m) * theta);
+    let relative_score = q[0] * k_rel[0] + q[1] * k_rel[1];
+    assert!(close(rotated_score, relative_score));
+    // Hand calculation (explain.md): both ≈ 7.0532021 (7.053202107896084 in f64).
+    assert!(
+        (rotated_score - 7.053_202_107_896_084).abs() < 1e-12,
+        "{rotated_score}"
+    );
+}
+
+// ===========================================================================
+// Stage 7: layouts and partial RoPE
+// ===========================================================================
+
+use rust_rope::rope::config::RopeLayout;
+
+fn rotary_layout(rotary: usize, head: usize, layout: RopeLayout) -> RotaryEmbedding {
+    RotaryEmbedding::new(
+        config(rotary, 10_000.0)
+            .with_layout(layout)
+            .with_head_dimension(head)
+            .unwrap(),
+    )
+}
+
+/// The invariants of Stage 4 hold for both layouts and partial RoPE:
+/// position 0 is the identity, lengths are kept, rotations compose, and the
+/// dot product depends only on the distance.
+#[test]
+fn stage_4_invariants_hold_for_every_layout_and_partial_rope() {
+    for layout in [RopeLayout::Interleaved, RopeLayout::SplitHalf] {
+        for (rotary, head) in [(8, 8), (8, 16), (64, 128), (2, 5)] {
+            let r = rotary_layout(rotary, head, layout);
+            let (u, v) = (test_vector(head, 0.2), test_vector(head, 1.7));
+            assert_eq!(r.rotate(&u, Position::ZERO).unwrap(), u);
+            let y = r.rotate(&u, pos(500)).unwrap();
+            assert!(
+                close(squared_norm(&u), squared_norm(&y)),
+                "{layout:?} {rotary}/{head}"
+            );
+            let twice = r.rotate(&r.rotate(&u, pos(30)).unwrap(), pos(12)).unwrap();
+            let once = r.rotate(&u, pos(42)).unwrap();
+            assert!(twice.iter().zip(&once).all(|(a, b)| close(*a, *b)));
+            let score = |m, n| {
+                dot_slices(
+                    &r.rotate(&u, pos(m)).unwrap(),
+                    &r.rotate(&v, pos(n)).unwrap(),
+                )
+            };
+            assert!(
+                close(score(3, 10), score(103, 110)),
+                "{layout:?} {rotary}/{head}"
+            );
+        }
+    }
+}
+
+/// Each split-half pair j receives exactly the angle m·θⱼ.
+#[test]
+fn split_half_pairs_get_the_correct_angles() {
+    use std::f64::consts::{PI, TAU};
+    let d = 8;
+    let r = rotary_layout(d, d, RopeLayout::SplitHalf);
+    for j in 0..d / 2 {
+        let mut e = vec![0.0; d];
+        e[j] = 1.0;
+        for m in [1, 2, 3] {
+            let y = r.rotate(&e, pos(m)).unwrap();
+            let expected = m as f64 * r.inverse_frequencies()[j];
+            let reduced = expected - TAU * ((expected + PI) / TAU).floor();
+            let measured = Complex::new(y[j], y[j + d / 2]).phase();
+            assert!(close(measured, reduced), "j = {j}, m = {m}");
+        }
+    }
+}
+
+/// Both layouts use the same frequency convention θⱼ = b^(−2j/d), with d the
+/// rotary dimension (not the head dimension).
+#[test]
+fn both_layouts_use_the_same_frequencies() {
+    let a = rotary_layout(64, 128, RopeLayout::Interleaved);
+    let b = rotary_layout(64, 128, RopeLayout::SplitHalf);
+    assert_eq!(a.inverse_frequencies(), b.inverse_frequencies());
+    assert_eq!(
+        a.inverse_frequencies(),
+        inverse_frequencies(&config(64, 10_000.0))
+    );
+}
+
+// ===========================================================================
+// Stage 8: scaling methods
+// ===========================================================================
+
+use rust_rope::rope::scaling::{RopeScaling, scaled_inverse_frequencies};
+
+/// Position interpolation equals "standard RoPE at the position m·L/L'"
+/// whenever m·L/L' is an integer.
+#[test]
+fn position_interpolation_equals_standard_rope_at_the_scaled_position() {
+    let config = config(64, 10_000.0);
+    let pi = RotaryEmbedding::with_scaling(
+        config,
+        RopeScaling::PositionInterpolation {
+            original_context: 2048,
+            target_context: 8192,
+        },
+    )
+    .unwrap();
+    let standard = RotaryEmbedding::new(config);
+    let x = test_vector(64, 0.4);
+    for m in [0, 4, 400, 4096, 8188] {
+        let a = pi.rotate(&x, pos(m)).unwrap();
+        let b = standard.rotate(&x, pos(m / 4)).unwrap();
+        assert!(a.iter().zip(&b).all(|(p, q)| close(*p, *q)), "m = {m}");
+    }
+}
+
+/// Interpolation keeps every angle inside the trained range: the largest
+/// angle of the slowest pair at m = L' − 1 is below the angle at m = L.
+#[test]
+fn interpolated_angles_stay_in_the_trained_range() {
+    let c = config(8, 10_000.0);
+    let theta = inverse_frequencies(&c);
+    let scaled = scaled_inverse_frequencies(
+        &c,
+        &RopeScaling::PositionInterpolation {
+            original_context: 2048,
+            target_context: 8192,
+        },
+    )
+    .unwrap();
+    for j in 0..4 {
+        assert!(8191.0 * scaled[j] < 2048.0 * theta[j], "j = {j}");
+    }
+}
+
+/// The relative-position property survives every scaling method: each
+/// method only changes θⱼ (and multiplies by a constant for YaRN).
+#[test]
+fn relative_position_property_holds_with_scaling() {
+    let c = config(16, 10_000.0);
+    let (u, v) = (test_vector(16, 1.0), test_vector(16, -2.0));
+    for s in [
+        RopeScaling::Linear { factor: 4.0 },
+        RopeScaling::NtkAware { factor: 8.0 },
+        RopeScaling::yarn(16.0, 4096),
+    ] {
+        let r = RotaryEmbedding::with_scaling(c, s).unwrap();
+        let score = |m, n| {
+            dot_slices(
+                &r.rotate(&u, pos(m)).unwrap(),
+                &r.rotate(&v, pos(n)).unwrap(),
+            )
+        };
+        assert!(close(score(10, 30), score(9000, 9020)), "{s:?}");
+    }
+}
+
+/// NTK-aware scaling for several rotary dimensions: the fastest pair stays,
+/// the slowest pair is divided by s, and the base grows as b·s^(d/(d−2)).
+#[test]
+fn ntk_aware_for_different_rotary_dimensions() {
+    for d in [4, 8, 32, 64, 128] {
+        let c = config(d, 10_000.0);
+        let theta = inverse_frequencies(&c);
+        for s in [2.0, 4.0, 16.0] {
+            let ntk = scaled_inverse_frequencies(&c, &RopeScaling::NtkAware { factor: s }).unwrap();
+            assert_eq!(ntk[0], 1.0);
+            let last = d / 2 - 1;
+            assert!(
+                (ntk[last] / (theta[last] / s) - 1.0).abs() < 1e-13,
+                "d = {d}, s = {s}"
+            );
+            // The geometric structure stays: a constant ratio b'^(−2/d).
+            let ratio = (10_000.0 * s.powf(d as f64 / (d as f64 - 2.0))).powf(-2.0 / d as f64);
+            for w in ntk.windows(2) {
+                assert!(close(w[1] / w[0], ratio), "d = {d}, s = {s}");
+            }
+        }
+    }
+}
+
+/// Numerical stability: large factors and large positions give finite
+/// outputs; lengths are kept (multiplied by the YaRN factor squared).
+#[test]
+fn scaling_is_numerically_stable_at_large_positions() {
+    let c = config(128, 500_000.0);
+    let x = test_vector(128, 0.6);
+    for s in [
+        RopeScaling::Linear { factor: 64.0 },
+        RopeScaling::NtkAware { factor: 64.0 },
+        RopeScaling::yarn(64.0, 8192),
+    ] {
+        let r = RotaryEmbedding::with_scaling(c, s).unwrap();
+        let f2 = r.attention_factor() * r.attention_factor();
+        for m in [100_000, 524_287, 10_000_000] {
+            let y = r.rotate(&x, pos(m)).unwrap();
+            assert!(y.iter().all(|v| v.is_finite()), "{s:?} m = {m}");
+            assert!(
+                close(squared_norm(&y), f2 * squared_norm(&x)),
+                "{s:?} m = {m}"
             );
         }
     }

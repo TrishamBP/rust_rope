@@ -4,9 +4,9 @@ This document collects the mathematics of the project in one place. It is a
 compact reference. The full explanations, with Rust details and numerical
 examples, are in `explain.md` (the entry numbers are given below).
 
-> **Status:** Stage 3 is complete. Sections 2–7 are **implemented** in
-> `src/math/`. Section 8 (frequencies, positions and angles) is
-> **implemented** in `src/rope/`. Sections 9–11 are **planned**.
+> **Status:** Stage 8 is complete. Sections 2–8 and 12–16 are
+> **implemented**. Sections 9–11 were planning notes; their status notes
+> point to the implemented sections. Stage 9 (CPU performance) is planned.
 
 ---
 
@@ -411,6 +411,136 @@ Both are tested in `tests/numerical_tests.rs`. Planned: the extension to all
 Planned topics: the "interleaved" layout (pairs `(0,1), (2,3), ...`) and the
 "split-half" layout (pairs `(j, j + d/2)`).
 
+> **Status update (2026-11-01):** the interleaved layout was implemented in
+> Stage 4 and the split-half layout in Stage 7. See sections 12 and 15.
+
 ## 11. Context extension — planned (Stage 5)
 
 Planned topics: position interpolation, NTK-aware scaling and YaRN.
+
+> **Status update (2026-11-01):** implemented in Stage 8 (the stage numbers
+> were redefined). See section 16. The full-vector relative-position property
+> of section 9 is in section 13.
+
+
+---
+
+## 12. The RoPE transformation of a vector — implemented (Stage 4, Entry 10)
+
+For `x ∈ R^d` at position `m`, interleaved pairs `(x₂ⱼ, x₂ⱼ₊₁)`:
+
+```text
+x'₂ⱼ   = x₂ⱼ cos(m·θⱼ) − x₂ⱼ₊₁ sin(m·θⱼ)
+x'₂ⱼ₊₁ = x₂ⱼ sin(m·θⱼ) + x₂ⱼ₊₁ cos(m·θⱼ)
+RoPE(x, m) = R_m·x,    R_m = diag(R(m·θ₀), …, R(m·θ_(d/2−1)))      (block-diagonal)
+```
+
+- **Complex form:** `zⱼ = x₂ⱼ + i·x₂ⱼ₊₁ ↦ zⱼ·e^(i·m·θⱼ)`.
+- **Length per pair:** the cross terms cancel and `sin² + cos² = 1`, so
+  `x'₂ⱼ² + x'₂ⱼ₊₁² = x₂ⱼ² + x₂ⱼ₊₁²`.
+- **Composition:** `RoPE(RoPE(x, m), n) = RoPE(x, m + n)`.
+- **Linearity:** `RoPE(a·u + c·v, m) = a·RoPE(u, m) + c·RoPE(v, m)`.
+- **Worked example** (`d = 8`, `b = 10000`, `m = 1`, `x = [1, …, 8]`):
+  `x' = [−1.1426397, 1.9220756, 2.5856788, 4.2795169, 4.9397510,
+  6.0496992, 6.9919965, 8.0069960]`, `‖x‖² = ‖x'‖² = 204`.
+- **Precision:** position 0 is exact; the composition error grows like
+  `(m + n)·ε` (measured `3.9 × 10⁻¹¹` at `m + n = 1.3 × 10⁶`).
+
+## 13. Attention tensors and the relative-position property — implemented (Stage 5, Entries 11–12)
+
+**Shapes.** `X ∈ R^(B×S×D_model)`; `Q = XW_Q`, `K = XW_K`, `V = XW_V`;
+`D_model = H·D`; reshape to `[B, S, H, D]` (no data movement).
+
+**Flat index (row-major):**
+
+```text
+index(b, s, h, d) = b·S·H·D + s·H·D + h·D + d = ((b·S + s)·H + h)·D + d
+strides = [S·H·D, H·D, D, 1]
+```
+
+Example (`S = 4, H = 2, D = 4`): `(1, 2, 1, 3) → ((1·4 + 2)·2 + 1)·4 + 3 = 55`.
+
+**RoPE on attention:** `Q'[b, s, h] = R_(start+s)·Q[b, s, h]`, the same for
+`K`; `V' = V`. All heads share `θⱼ`.
+
+**The relative-position property (full derivation):**
+
+```text
+(R(m)q)ᵀ(R(n)k) = qᵀ R(m)ᵀ R(n) k        (Ax)ᵀ = xᵀAᵀ
+                = qᵀ R(−m) R(n) k        R(m)ᵀ = R(−m) (orthogonal, block by block)
+                = qᵀ R(n − m) k          R(a)R(b) = R(a + b) (block by block)
+```
+
+**2-D demonstration** (`q = [1, 2]`, `k = [3, −1]`, `θ = 0.5`, `m = 2`,
+`n = 5`): `R(1)q = [−1.1426397, 1.9220756]`, `R(2.5)k = [−1.8049587,
+2.5965600]`, dot product `7.0532021`; `R(1.5)k = [1.2097066, 2.9217478]`,
+`qᵀR(1.5)k = 7.0532021`. Without RoPE: `qᵀk = 1`.
+
+## 14. Numerical precision and reference validation — implemented (Stage 6, Entry 13)
+
+| Type | Significant bits | `ε` |
+|---|---|---|
+| `f32` | 24 | `2^−23 ≈ 1.19 × 10⁻⁷` |
+| `f64` | 53 | `2^−52 ≈ 2.22 × 10⁻¹⁶` |
+
+- One basic operation: relative error `≤ ε/2` (correct rounding).
+- The angle `φ = m·θ` has an absolute error `≈ ε·φ`; the output error is
+  about `c·ε·(1 + φ_max)·max|x|`.
+- **Tolerance used for the PyTorch comparison:**
+  `tol = 8·ε·(1 + max_angle)·max(1, max|x|)`.
+- **Error measures:** `max|r − p|`, `mean|r − p|`, and
+  `max|r − p|/|p|` only for `|p| ≥ 10⁻³·max|p|` (relative error is
+  meaningless near zero).
+- **Two conventions:** `b^(−x)` (Rust) and `1/b^x` (reference) differ by
+  1 ulp for some `θⱼ` (24 of 64 for `d = 128`); at `m = 10⁵` this gives
+  `≈ 5.6 × 10⁻¹²` angle difference and `1.9 × 10⁻¹¹` output difference.
+- **Results:** float64 worst `1.9 × 10⁻¹¹`; float32 worst `1.1 × 10⁻²`
+  (288 cases, all pass).
+
+## 15. Dimension layouts and partial RoPE — implemented (Stage 7, Entries 14–15)
+
+| Layout | Pair `j` |
+|---|---|
+| Interleaved | `(x₂ⱼ, x₂ⱼ₊₁)` |
+| Split-half | `(xⱼ, x_(j + d/2))` |
+
+```text
+split-half:  x'ⱼ = xⱼ cos φⱼ − x_(j+d/2) sin φⱼ,   x'_(j+d/2) = xⱼ sin φⱼ + x_(j+d/2) cos φⱼ
+rotate_half form:  x' = x ⊙ [cos, cos] + rotate_half(x) ⊙ [sin, sin],  rotate_half([a, b]) = [−b, a]
+RoPE_split(x) = Pᵀ · RoPE_inter(P·x)      (P: xⱼ → slot 2j, x_(j+d/2) → slot 2j+1)
+```
+
+**Partial RoPE** (head dimension `D`, rotary dimension `d ≤ D`, `d` even):
+
+```text
+x' = [RoPE(x[0..d]), x[d..D]],    θⱼ = b^(−2j/d)   (d, not D)
+score = q_rotᵀ R(n − m) k_rot + q_passᵀ k_pass
+```
+
+## 16. RoPE scaling for long contexts — implemented (Stage 8, Entry 16)
+
+Symbols: `L` original context, `L'` target context, `s = L'/L ≥ 1`.
+
+| Method | Formula | Source |
+|---|---|---|
+| Position interpolation | `φ' = (m·L/L')·θⱼ` | Chen et al., 2023 |
+| Linear | `θ'ⱼ = θⱼ/s` (equal to PI: `(m/s)θ = m(θ/s)`) | common implementations |
+| NTK-aware (static) | `b' = b·s^(d/(d−2))`, `θ'ⱼ = b'^(−2j/d)` | bloc97, 2023; YaRN paper §3.1 |
+| YaRN (paper form) | `r(j) = L·θⱼ/(2π)`, `γ(r) = clamp((r − α)/(β − α), 0, 1)`, `θ'ⱼ = (1 − γ)θⱼ/s + γθⱼ`, factor `0.1·ln s + 1` | Peng et al., 2023 |
+
+**NTK derivation:** require `θ'_(d/2−1) = θ_(d/2−1)/s` →
+`b'^((d−2)/d) = s·b^((d−2)/d)` → `b' = b·s^(d/(d−2))`; then
+`θ'ⱼ/θⱼ = s^(−2j/(d−2))`.
+
+**Example** (`d = 8`, `b = 10000`, `L = 2048`, `s = 4`):
+
+| `j` | `θⱼ` | PI / linear | NTK (`b' = 63 496`) | YaRN (`r`, `γ`) |
+|---|---|---|---|---|
+| 0 | 1 | 0.25 | 1 | 1 (`r = 325.9`, `γ = 1`) |
+| 1 | 0.1 | 0.025 | 0.0630 | 0.1 (`r = 32.6`, `γ = 1`) |
+| 2 | 0.01 | 0.0025 | 0.003969 | 0.003047 (`r = 3.26`, `γ = 0.0729`) |
+| 3 | 0.001 | 0.00025 | 0.00025 | 0.00025 (`r = 0.326`, `γ = 0`) |
+
+YaRN attention factor: `0.1·ln 4 + 1 = 1.1386` (score factor `1.2965`).
+**Not implemented:** dynamic NTK, the Hugging Face YaRN discretization,
+LongRoPE.

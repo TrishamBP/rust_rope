@@ -13,6 +13,11 @@
 //! - [`validate_inverse_frequency`] and [`validate_inverse_frequencies`]:
 //!   an inverse frequency `θⱼ` must be a finite number greater than 0.
 //!
+//! ## Implemented (Stage 4)
+//!
+//! - [`validate_embedding_dimension`]: an embedding must have exactly `d`
+//!   components.
+//!
 //! ## Why validation is a separate module
 //!
 //! The checks are small, but several modules use them. If each module had
@@ -98,6 +103,60 @@ pub enum RopeError {
         /// The number of columns (pairs).
         columns: usize,
     },
+    /// An embedding vector does not have the dimension `d` of the RoPE
+    /// configuration. (Added in Stage 4.)
+    EmbeddingDimensionMismatch {
+        /// The dimension `d` of the configuration.
+        expected: usize,
+        /// The number of components of the embedding.
+        actual: usize,
+    },
+    /// A query tensor and a key tensor have different batch sizes or
+    /// sequence lengths. (Added in Stage 5.) Each query token and each key
+    /// token at the same index must have the same position, so `B` and `S`
+    /// must be equal. The number of heads may differ.
+    QueryKeyShapeMismatch {
+        /// `(B, S)` of the query tensor.
+        query: (usize, usize),
+        /// `(B, S)` of the key tensor.
+        key: (usize, usize),
+    },
+    /// The rotary dimension `d` is larger than the head dimension `D`.
+    /// (Added in Stage 7.) RoPE can rotate only components that exist.
+    RotaryDimensionTooLarge {
+        /// The rotary dimension `d`.
+        rotary_dimension: usize,
+        /// The head dimension `D`.
+        head_dimension: usize,
+    },
+    /// A scaling factor `s` is not finite or `s < 1`. (Added in Stage 8.)
+    InvalidScalingFactor {
+        /// The invalid factor.
+        factor: f64,
+    },
+    /// The context lengths of a scaling method are invalid: the original
+    /// length `L` is 0, or the target length `L'` is smaller than `L`.
+    /// (Added in Stage 8.)
+    InvalidContextLengths {
+        /// `L`.
+        original: usize,
+        /// `L'`.
+        target: usize,
+    },
+    /// The YaRN ramp boundaries are invalid: they must be finite with
+    /// `0 ≤ α < β`. (Added in Stage 8.)
+    InvalidYarnRange {
+        /// `α`.
+        alpha: f64,
+        /// `β`.
+        beta: f64,
+    },
+    /// NTK-aware scaling uses the exponent `d/(d − 2)`, which is undefined
+    /// for `d = 2`. (Added in Stage 8.)
+    NtkRequiresLargerDimension {
+        /// The rotary dimension `d`.
+        rotary_dimension: usize,
+    },
 }
 
 impl fmt::Display for RopeError {
@@ -157,6 +216,41 @@ impl fmt::Display for RopeError {
             RopeError::TableTooLarge { rows, columns } => write!(
                 f,
                 "a table with {rows} rows and {columns} columns has too many elements"
+            ),
+            RopeError::EmbeddingDimensionMismatch { expected, actual } => write!(
+                f,
+                "the embedding has {actual} components, but the RoPE configuration \
+                 has the dimension {expected}"
+            ),
+            RopeError::QueryKeyShapeMismatch { query, key } => write!(
+                f,
+                "the query tensor has (batch, sequence) = {query:?},                  but the key tensor has {key:?}; they must be equal"
+            ),
+            RopeError::RotaryDimensionTooLarge {
+                rotary_dimension,
+                head_dimension,
+            } => write!(
+                f,
+                "the rotary dimension {rotary_dimension} is larger than the head \
+                 dimension {head_dimension}"
+            ),
+            RopeError::InvalidScalingFactor { factor } => write!(
+                f,
+                "the scaling factor {factor} is not valid; it must be a finite number of at least 1"
+            ),
+            RopeError::InvalidContextLengths { original, target } => write!(
+                f,
+                "the context lengths are not valid (original {original}, target {target}); \
+                 the original must be at least 1 and the target at least the original"
+            ),
+            RopeError::InvalidYarnRange { alpha, beta } => write!(
+                f,
+                "the YaRN range alpha = {alpha}, beta = {beta} is not valid; \
+                 it must be finite with 0 <= alpha < beta"
+            ),
+            RopeError::NtkRequiresLargerDimension { rotary_dimension } => write!(
+                f,
+                "NTK-aware scaling needs a rotary dimension of at least 4, got {rotary_dimension}"
             ),
         }
     }
@@ -302,9 +396,153 @@ pub fn validate_inverse_frequencies(values: &[f64]) -> Result<(), RopeError> {
     Ok(())
 }
 
+/// Checks that an embedding has exactly `expected` components.
+///
+/// RoPE divides the embedding into `d/2` pairs and rotates pair `j` with
+/// the frequency `θⱼ`. If the embedding has a different length, some pairs
+/// would have no frequency, or some frequencies would have no pair. (Added
+/// in Stage 4.)
+///
+/// An odd length is also caught by this check, because `expected` is the
+/// validated, even dimension `d` of a `RopeConfig`.
+///
+/// # Errors
+///
+/// [`RopeError::EmbeddingDimensionMismatch`] if `actual != expected`.
+///
+/// # Example
+///
+/// ```
+/// use rust_rope::utils::validation::{validate_embedding_dimension, RopeError};
+///
+/// assert_eq!(validate_embedding_dimension(8, 8), Ok(()));
+/// assert_eq!(
+///     validate_embedding_dimension(7, 8),
+///     Err(RopeError::EmbeddingDimensionMismatch { expected: 8, actual: 7 })
+/// );
+/// ```
+pub fn validate_embedding_dimension(actual: usize, expected: usize) -> Result<(), RopeError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(RopeError::EmbeddingDimensionMismatch { expected, actual })
+    }
+}
+
+/// Checks that the head dimension `D` is at least the rotary dimension `d`.
+/// (Added in Stage 7.)
+///
+/// `d` itself must already be valid (even, ≥ 2). `D` may be odd: only the
+/// first `d` components form pairs.
+///
+/// # Errors
+///
+/// [`RopeError::RotaryDimensionTooLarge`] if `head_dimension < rotary_dimension`.
+pub fn validate_head_dimension(
+    head_dimension: usize,
+    rotary_dimension: usize,
+) -> Result<(), RopeError> {
+    if head_dimension >= rotary_dimension {
+        Ok(())
+    } else {
+        Err(RopeError::RotaryDimensionTooLarge {
+            rotary_dimension,
+            head_dimension,
+        })
+    }
+}
+
+/// Checks a scaling factor `s`: finite and `s ≥ 1`. (Added in Stage 8.)
+///
+/// `s = 1` means "no scaling". `s < 1` would shrink the context; no scaling
+/// method in this project uses it.
+///
+/// # Errors
+///
+/// [`RopeError::InvalidScalingFactor`].
+pub fn validate_scaling_factor(factor: f64) -> Result<(), RopeError> {
+    // Written for the valid case, so that NaN is rejected (Entry 7, 4.6).
+    if factor >= 1.0 && factor.is_finite() {
+        Ok(())
+    } else {
+        Err(RopeError::InvalidScalingFactor { factor })
+    }
+}
+
+/// Checks context lengths: `L ≥ 1` and `L' ≥ L`. (Added in Stage 8.)
+///
+/// # Errors
+///
+/// [`RopeError::InvalidContextLengths`].
+pub fn validate_context_lengths(original: usize, target: usize) -> Result<(), RopeError> {
+    if original >= 1 && target >= original {
+        Ok(())
+    } else {
+        Err(RopeError::InvalidContextLengths { original, target })
+    }
+}
+
+/// Checks the YaRN ramp boundaries: finite and `0 ≤ α < β`. (Added in
+/// Stage 8.)
+///
+/// # Errors
+///
+/// [`RopeError::InvalidYarnRange`].
+pub fn validate_yarn_range(alpha: f64, beta: f64) -> Result<(), RopeError> {
+    if alpha >= 0.0 && beta > alpha && beta.is_finite() {
+        Ok(())
+    } else {
+        Err(RopeError::InvalidYarnRange { alpha, beta })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaling_parameter_checks() {
+        assert!(validate_scaling_factor(1.0).is_ok());
+        assert!(validate_scaling_factor(32.0).is_ok());
+        assert!(validate_scaling_factor(0.99).is_err());
+        assert!(validate_scaling_factor(f64::NAN).is_err());
+        assert!(validate_context_lengths(2048, 8192).is_ok());
+        assert!(validate_context_lengths(2048, 2048).is_ok());
+        assert!(validate_context_lengths(0, 8192).is_err());
+        assert!(validate_context_lengths(4096, 2048).is_err());
+        assert!(validate_yarn_range(1.0, 32.0).is_ok());
+        assert!(validate_yarn_range(32.0, 32.0).is_err());
+        assert!(validate_yarn_range(-1.0, 32.0).is_err());
+        assert!(validate_yarn_range(1.0, f64::INFINITY).is_err());
+        assert!(validate_yarn_range(f64::NAN, 32.0).is_err());
+    }
+
+    #[test]
+    fn head_dimension_must_not_be_smaller_than_rotary_dimension() {
+        assert_eq!(validate_head_dimension(128, 64), Ok(()));
+        assert_eq!(validate_head_dimension(64, 64), Ok(()));
+        assert!(validate_head_dimension(62, 64).is_err());
+    }
+
+    #[test]
+    fn embedding_dimension_must_match_exactly() {
+        assert_eq!(validate_embedding_dimension(64, 64), Ok(()));
+        for actual in [0, 7, 62, 66, 128] {
+            assert_eq!(
+                validate_embedding_dimension(actual, 64),
+                Err(RopeError::EmbeddingDimensionMismatch {
+                    expected: 64,
+                    actual
+                })
+            );
+        }
+        let message = RopeError::EmbeddingDimensionMismatch {
+            expected: 8,
+            actual: 6,
+        }
+        .to_string();
+        assert!(message.contains('6') && message.contains('8'), "{message}");
+    }
 
     #[test]
     fn even_nonzero_dimensions_are_valid() {

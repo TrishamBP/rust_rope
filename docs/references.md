@@ -21,7 +21,7 @@ We add new sources when a stage needs them.
 6. Touvron, H., et al. (2023). *LLaMA: Open and Efficient Foundation Language
    Models.* arXiv:2302.13971. — A widely used model that uses RoPE.
 
-## Context extension (Stage 5)
+## Context extension (Stage 8; originally planned as Stage 5)
 
 7. Chen, S., Wong, S., Chen, L., Tian, Y. (2023). *Extending Context Window of
    Large Language Models via Positional Interpolation.* arXiv:2306.15595.
@@ -29,6 +29,21 @@ We add new sources when a stage needs them.
    (r/LocalLLaMA). — The origin of NTK-aware scaling.
 9. Peng, B., Quesnelle, J., Fan, H., Shippole, E. (2023). *YaRN: Efficient
    Context Window Extension of Large Language Models.* arXiv:2309.00071.
+   — Section 3.1 states the NTK-aware formula `b' = b·s^(|D|/(|D|−2))`;
+   sections 3.2 and 3.4 define the ramp `γ(r)` (with `α = 1`, `β = 32` for
+   LLaMA) and the factor `√(1/t) = 0.1·ln(s) + 1`. This project implements
+   these formulas (Stage 8).
+18. Jacot, A., Gabriel, F., Hongler, C. (2018). *Neural Tangent Kernel:
+    Convergence and Generalization in Neural Networks.* arXiv:1806.07572.
+    — The theory behind the name "NTK-aware".
+19. Tancik, M., et al. (2020). *Fourier Features Let Networks Learn High
+    Frequency Functions in Low Dimensional Domains.* arXiv:2006.10739.
+    — Why high-frequency input features matter.
+20. Hugging Face `transformers`, `modeling_rope_utils.py`
+    (`_compute_linear_scaling_rope_parameters`,
+    `_compute_dynamic_ntk_parameters`, `_compute_yarn_parameters`). — A
+    widely used implementation. Its YaRN ramp is discretized over dimension
+    indices (`floor`/`ceil`); this project does not reproduce that detail.
 
 ## Rust
 
@@ -39,6 +54,11 @@ We add new sources when a stage needs them.
 13. *The Rustonomicon* (unsafe Rust and memory layout).
     https://doc.rust-lang.org/nomicon/
 14. *The Rust Performance Book.* https://nnethercote.github.io/perf-book/
+
+## Validation tooling (Stage 6)
+
+21. PyTorch (2.15.0, CPU build). https://pytorch.org — used only in
+    `reference/` as an independent numerical reference.
 
 ## Numerical computing
 

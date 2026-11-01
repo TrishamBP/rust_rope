@@ -3,10 +3,12 @@
 An educational, from-scratch implementation of **Rotary Position Embeddings
 (RoPE)** in Rust.
 
-> **Status:** Stage 3 complete (review pending) — RoPE fundamentals. The
-> library calculates the inverse frequencies `θⱼ = b^(−2j/d)`, token
-> positions, and the positional angles `m·θⱼ`. It does not rotate embedding
-> vectors yet (Stage 4).
+> **Status:** Stage 8 complete (review pending) — RoPE scaling. The library
+> rotates vectors and `[B, S, H, D]` query/key tensors with interleaved or
+> split-half layouts, full or partial rotation, and four scaling methods
+> (position interpolation, linear, NTK-aware, YaRN). An independent PyTorch
+> reference validates 288 cases. Stage 9 (CPU performance) is planned and
+> waits for approval. Full guide: `ROPE_Engineering.pdf`.
 
 ---
 
@@ -112,37 +114,43 @@ Legend: ✅ done · 🔄 in progress · ⏳ planned
 - Applying rotations to embedding dimensions. ⏳ Moved to Stage 4 (the
   Stage 3 scope excludes vector rotation).
 
-### Stage 4: RoPE implementation — ⏳
+> **Roadmap change (2026-11-01):** the project owner redefined Stages 5–9.
+> The old Stage 5 (advanced RoPE) is now Stage 8; the old Stage 6
+> (performance) is now Stage 9; the old Stage 7 (validation) became
+> Stage 6.
 
-- Pairwise dimension rotations.
-- Different dimension layouts.
-- Embedding transformations.
-- Numerical validation.
+### Stage 4: RoPE implementation — ✅
 
-### Stage 5: Advanced RoPE — ⏳
+- Pairwise dimension rotations. ✅ `rope::rotations::rotate_pair`
+- Embedding transformations. ✅ `rope::embeddings::RotaryEmbedding::{rotate, rotate_in_place}`
+- Numerical validation (invariants A–E). ✅ `tests/numerical_tests.rs`
 
-- Frequency scaling.
-- Extended context techniques.
-- NTK-aware scaling.
-- YaRN.
-- Comparison of RoPE variants.
+### Stage 5: Query and key tensors — ✅
 
-### Stage 6: Performance engineering — ⏳
+- Flat `[B, S, H, D]` tensor. ✅ `math::tensor::Tensor4`
+- RoPE on queries and keys, values unchanged. ✅ `rotate_query_key[_in_place]`, `rotate_tensor_in_place`
+- Relative-position property in scores. ✅ tested
+- Simple benchmark. ✅ `benches/rope_benchmark.rs`
 
-- Memory allocation analysis.
-- Stack versus heap.
-- Cache locality.
-- SIMD opportunities.
-- Benchmarking.
-- Optimizing CPU execution.
+### Stage 6: PyTorch reference validation — ✅
 
-### Stage 7: Validation and experimentation — ⏳
+- Independent reference. ✅ `reference/pytorch_rope.py`
+- float64 and float32 comparison, error statistics. ✅ `reference/compare_rope.py`
 
-- Unit tests.
-- Numerical tests.
-- Mathematical invariants.
-- Comparison against a reference implementation.
-- Performance reports.
+### Stage 7: Layouts and partial RoPE — ✅
+
+- Interleaved and split-half layouts. ✅ `rope::config::RopeLayout`
+- Partial rotation. ✅ `RopeConfig::with_head_dimension`
+
+### Stage 8: RoPE scaling — ✅
+
+- Position interpolation, linear, NTK-aware, YaRN. ✅ `rope::scaling::RopeScaling`
+- Not implemented: dynamic NTK, the Hugging Face YaRN discretization, LongRoPE.
+
+### Stage 9: CPU performance engineering — ⏳ (waiting for approval)
+
+- Criterion benchmarks, allocation analysis, `cos`/`sin` caches, loop
+  variants, SIMD, Rayon, build settings.
 
 ## 7. Technology stack
 
@@ -164,7 +172,10 @@ cargo run                      # Run the demonstration binary (src/main.rs)
 cargo test                     # Run unit tests and integration tests
 cargo run --example math_foundations # Print the Stage 2 numerical examples
 cargo run --example rope_frequencies # Print the Stage 3 frequencies and angles
-cargo run --example basic_rope # Run the RoPE example (placeholder)
+cargo run --example basic_rope       # The Stage 4 worked example
+cargo run --example export_reference_cases           # Stage 6: export cases
+reference/.venv/Scripts/python reference/compare_rope.py  # Stage 6: PyTorch comparison
+scripts/.venv/Scripts/python scripts/build_pdf.py        # rebuild ROPE_Engineering.pdf
 cargo bench                    # Run the benchmarks (optimized build)
 cargo fmt                      # Format the code
 cargo clippy --all-targets     # Run the linter
@@ -177,3 +188,7 @@ cargo doc --open               # Build and open the API documentation
 - [`docs/mathematics.md`](docs/mathematics.md) — mathematical notes.
 - [`docs/architecture.md`](docs/architecture.md) — module design.
 - [`docs/references.md`](docs/references.md) — papers and resources.
+- [`ROPE_Engineering.pdf`](ROPE_Engineering.pdf) — the complete engineering guide (source:
+  [`docs/ROPE_Engineering.md`](docs/ROPE_Engineering.md), diagrams in `docs/diagrams/`,
+  generator `scripts/build_pdf.py`; setup: `python -m venv scripts/.venv` and
+  `scripts/.venv/Scripts/python -m pip install -r scripts/requirements.txt`; needs Chrome or Edge).

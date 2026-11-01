@@ -3,10 +3,9 @@
 This document describes the structure of `rust_rope`.
 It explains what each part does, and why the parts are separate.
 
-> **Status:** Stage 3 is complete. The `math` module is implemented.
-> `rope::config`, `rope::frequencies`, `rope::position` and
-> `utils::validation` are implemented. `rope::rotations`,
-> `rope::embeddings` and `rope::scaling` are empty (planned).
+> **Status:** Stage 8 is complete. All modules are implemented. Sections
+> 1–7 describe the state after Stage 3 (kept for the learning history);
+> sections 8–12 describe the current state.
 
 ---
 
@@ -211,3 +210,104 @@ frequencies: θⱼ = base^(-2j/d)       │
 - No abstraction without a real need.
 - Only the standard library, unless `explain.md` justifies a dependency.
 - Errors that a caller can cause return `Result`.
+
+
+---
+
+## 8. Module tree after Stage 8 (status update 2026-11-01)
+
+The tree in section 2 shows the state after Stage 3. This is the current
+state.
+
+```text
+rust_rope (library)
+├── math                    General primitives (no RoPE knowledge)          ✅
+│   ├── (mod.rs)            approx_eq, DEFAULT_TOLERANCE
+│   ├── trigonometry        angles, sin, cos, sin_cos, unit circle
+│   ├── matrix              Vector, Vector2, Matrix2, rotate_vector
+│   ├── complex             Complex, from_polar, rotate
+│   └── tensor   (Stage 5)  TensorShape, Tensor4, TensorError ([B,S,H,D], flat Vec<f64>)
+├── rope                    RoPE-specific logic                              ✅
+│   ├── config              RopeConfig (d, b, head dimension D, RopeLayout), DEFAULT_BASE
+│   ├── frequencies         θⱼ = b^(−2j/d), angle, AngleTable
+│   ├── position            Position, PositionRange
+│   ├── rotations (Stage 4) rotate_pair (calls math::matrix::rotate_vector)
+│   ├── embeddings          RotaryEmbedding: rotate, rotate_in_place (Stage 4),
+│   │                       rotate_tensor_in_place, rotate_query_key[_in_place] (Stage 5),
+│   │                       layouts + partial (Stage 7), with_scaling (Stage 8)
+│   └── scaling  (Stage 8)  RopeScaling, scaled_inverse_frequencies
+└── utils
+    └── validation          RopeError (all variants), validate_* functions
+```
+
+Other targets:
+
+| Target | File | Purpose |
+|---|---|---|
+| Example | `examples/basic_rope.rs` | Entry 10 worked example (Stage 4) |
+| Example | `examples/export_reference_cases.rs` | Writes the 288 reference cases (Stages 6–8) |
+| Benchmark | `benches/rope_benchmark.rs` | Simple `std::time` benchmark (Stages 5, 7) |
+| Validation tooling | `reference/*.py` | Independent PyTorch reference (not production code) |
+
+## 9. Implementation flow (Stages 4–8)
+
+```text
+RopeConfig::new(d, b)?                          config.rs        (validated: d even ≥ 2, b > 1)
+   .with_layout(RopeLayout::SplitHalf)                           (Stage 7, default Interleaved)
+   .with_head_dimension(D)?                                      (Stage 7, partial if D > d)
+        │
+        ▼
+RotaryEmbedding::new(config)                    embeddings.rs    θⱼ computed ONE time
+RotaryEmbedding::with_scaling(config, s)?       + scaling.rs     θ'ⱼ and attention factor ONE time (Stage 8)
+        │
+        ├── rotate(&x, m)            → new Vec  (validate len = D, to_vec, loop)
+        ├── rotate_in_place(&mut x, m)          (validate, loop)
+        └── rotate_query_key[_in_place](q, k, start)    (Stage 5)
+                 │ validate (B, S equal; D = head dim; positions ≤ 2^53)
+                 ▼
+            rotate_tensor_unchecked
+                 data.chunks_exact_mut(S·H·D)   → batch element b
+                   .chunks_exact_mut(H·D).zip(positions) → token s, m = start + s
+                     .chunks_exact_mut(D)       → head h
+                        rotate_pairs(head, m)   ← the ONE rotation loop
+                            split_at_mut(d): rotary | pass-through (untouched)
+                            match layout:
+                              Interleaved: chunks_exact_mut(2) zip θ
+                              SplitHalf:   split_at_mut(d/2), zip θ
+                            φ = m·θⱼ (angle_unchecked), rotate_pair (sin_cos + 4 mul + 2 add),
+                            × attention factor (1.0 except YaRN)
+```
+
+## 10. Reference validation workflow (Stage 6)
+
+```text
+cargo run --example export_reference_cases
+   → reference/data/rust_cases.txt   (case line + input + Rust output, exact f64 text)
+reference/.venv/Scripts/python reference/compare_rope.py
+   → recompute with pytorch_rope.apply_rope in float64 and float32
+   → max abs / mean abs / max rel error, tolerance 8·ε·(1+max_angle)·max(1,max|x|)
+   → exit code 0 only if every case passes
+reference/.venv/Scripts/python -m unittest discover -s reference
+   → self-tests and negative controls (wrong layout/base/start/scaling must fail)
+```
+
+The Python code is **validation tooling**. The Rust library never depends on
+it.
+
+## 11. Scaling architecture (Stage 8)
+
+- `RopeScaling` (enum) holds only parameters.
+- `RopeScaling::validate(&config)` checks them (functions in
+  `utils::validation`).
+- `scaled_inverse_frequencies(&config, &scaling)` turns every method into a
+  `Vec` of `θ'ⱼ`.
+- `RotaryEmbedding::with_scaling` stores `θ'ⱼ` and
+  `attention_factor()`. The rotation loop never inspects the method.
+- `RopeConfig` does **not** contain scaling: it describes the model
+  geometry; scaling is a deployment choice.
+
+## 12. Planned (not implemented)
+
+- Stage 9: CPU performance engineering (Criterion benchmarks, `cos`/`sin`
+  caches, SIMD, Rayon). Waiting for approval.
+- Attention itself (softmax, masking), KV cache, GPU: outside the scope.

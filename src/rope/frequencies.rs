@@ -13,6 +13,10 @@
 //! The sine, the cosine and the rotation of embedding vectors are planned
 //! for Stage 4. This module only calculates the angles.
 //!
+//! **Status update (Stage 4):** the rotation is implemented in
+//! [`crate::rope::rotations`] and [`crate::rope::embeddings`]. This module
+//! still only calculates frequencies and angles.
+//!
 //! ## Notation
 //!
 //! | Symbol | Meaning | Rust name |
@@ -57,7 +61,7 @@ use crate::utils::validation::{
 /// - `powf(−x)` calculates `b^(−x)` with one rounding. The form
 ///   `1.0 / b.powf(x)` has two roundings (the power and the division).
 #[inline]
-fn inverse_frequency_unchecked(pair_index: usize, dimension: usize, base: f64) -> f64 {
+pub(crate) fn inverse_frequency_unchecked(pair_index: usize, dimension: usize, base: f64) -> f64 {
     let exponent = (2 * pair_index) as f64 / dimension as f64;
     base.powf(-exponent)
 }
@@ -142,8 +146,12 @@ pub fn inverse_frequencies(config: &RopeConfig) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 
 /// Calculates `φ = m · θ` without checks.
+///
+/// `pub(crate)`: visible in the whole `rust_rope` crate, but not to users of
+/// the library. `rope::embeddings` uses it (Stage 4), because its
+/// frequencies come from a validated `RopeConfig` and need no new check.
 #[inline]
-fn angle_unchecked(position: Position, inverse_frequency: f64) -> f64 {
+pub(crate) fn angle_unchecked(position: Position, inverse_frequency: f64) -> f64 {
     position.as_f64() * inverse_frequency
 }
 

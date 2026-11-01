@@ -5,15 +5,15 @@
 //!
 //! ## Status
 //!
-//! Stage 3 (RoPE fundamentals: frequencies, positions, angles) is complete.
+//! Stage 8 (RoPE scaling) is complete. Stage 9 (CPU performance) is planned.
 //!
-//! - Implemented: [`math`] (vectors, 2 × 2 matrices, rotations, complex
-//!   numbers, Euler's formula, trigonometry, float comparison).
-//! - Implemented: [`rope::config`], [`rope::frequencies`] (inverse
-//!   frequencies and positional angles), [`rope::position`], and
-//!   [`utils::validation`].
-//! - Planned: [`rope::rotations`] and [`rope::embeddings`] (Stage 4),
-//!   [`rope::scaling`] (Stage 5). These modules are empty.
+//! - [`math`]: vectors, 2 × 2 matrices, rotations, complex numbers, Euler's
+//!   formula, trigonometry, float comparison, the flat `[B, S, H, D]`
+//!   tensor (`math::tensor`).
+//! - [`rope`]: configuration (dimensions, base, layout, partial RoPE),
+//!   frequencies and angles, positions, pair rotation, the RoPE
+//!   transformation for vectors and query/key tensors, scaling methods.
+//! - [`utils`]: validation and the error type `RopeError`.
 //!
 //! ## Module layout
 //!

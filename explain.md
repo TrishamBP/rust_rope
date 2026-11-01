@@ -26,6 +26,13 @@ Each implementation milestone adds one new entry.
 | 7 | 2026-11-01 | Stage 3 | Configuration, validation and inverse frequencies (`RopeConfig`, `RopeError`, `θⱼ = b^(−2j/d)`) |
 | 8 | 2026-11-01 | Stage 3 | Position indexing (`Position`, `PositionRange`, the `2^53` limit) |
 | 9 | 2026-11-01 | Stage 3 | Positional angles `φ(m, j) = m·θⱼ` and the `AngleTable`; link to `R(m, j)` |
+| 10 | 2026-11-01 | Stage 4 | The RoPE transformation of a vector (`rotate_pair`, `RotaryEmbedding`, layouts) |
+| 11 | 2026-11-01 | Stage 5 | Attention tensor shapes `[B, S, H, D]` and the flat `Tensor4` |
+| 12 | 2026-11-01 | Stage 5 | RoPE on query and key tensors; values unchanged; relative position in scores |
+| 13 | 2026-11-01 | Stage 6 | Independent PyTorch reference validation; IEEE 754 and error analysis |
+| 14 | 2026-11-01 | Stage 7 | Interleaved and split-half layouts (`RopeLayout`) |
+| 15 | 2026-11-01 | Stage 7 | Partial RoPE, tensor integration, Stage 7 validation results |
+| 16 | 2026-11-01 | Stage 8 | RoPE scaling: position interpolation, linear, NTK-aware, YaRN |
 
 ---
 
@@ -4929,3 +4936,2583 @@ the state at that time. This table shows the current state.
 **Scope note.** The README listed "Applying rotations to embedding
 dimensions" under Stage 3. The Stage 3 task excluded it. It moves to
 Stage 4.
+
+
+---
+
+# Entry 10 — The RoPE transformation of an embedding vector (Stage 4)
+
+**Date:** 2026-11-01
+**Stage:** 4 (RoPE implementation)
+**Files:** `src/rope/rotations.rs`, `src/rope/embeddings.rs`,
+`src/rope/config.rs` (review), `src/rope/frequencies.rs`
+(`angle_unchecked` is now `pub(crate)`), `src/utils/validation.rs`
+(`EmbeddingDimensionMismatch`, `validate_embedding_dimension`),
+`examples/basic_rope.rs`, `tests/rope_tests.rs`, `tests/numerical_tests.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| Component A: `rotate_pair(pair, φ)` | ✅ Implemented |
+| Component B: `RotaryEmbedding` with `rotate` (new vector) and `rotate_in_place` | ✅ Implemented |
+| Component C: configuration review (`d`, `b`; no new options) | ✅ Done |
+| Interleaved (adjacent-pair) layout | ✅ Implemented — **the only layout** |
+| Split-half layout | ❌ Not implemented. Explained in section 3.8. |
+| A precomputed `cos`/`sin` cache | ❌ Not implemented (see the correction note below and section 8) |
+| Attention, queries/keys, scaling | ⏳ Later stages |
+
+**Correction note (2026-11-01) to the Stage 3 report and Entry 9.** Entry 9,
+section 3.9 says: "Stage 4 will build this cache from the `AngleTable`."
+Stage 4 did **not** build a `cos`/`sin` cache. The Stage 4 task asked for
+an easy-to-understand implementation without premature optimization. The
+cache stays a planned optimization (Stage 6).
+
+---
+
+## 1. What did we build?
+
+We built the complete RoPE transformation of one embedding vector:
+
+```text
+RoPE(x, m) = [R(m·θ₀)·(x₀, x₁),  R(m·θ₁)·(x₂, x₃),  ...,  R(m·θ_(d/2−1))·(x_(d−2), x_(d−1))]
+```
+
+- `rope::rotations::rotate_pair` rotates one pair by one angle.
+- `rope::embeddings::RotaryEmbedding` holds a configuration and its
+  inverse frequencies. Its method `rotate` returns a new rotated vector.
+  Its method `rotate_in_place` overwrites the input.
+
+## 2. Why did we build it?
+
+This is the core of RoPE. Stages 2 and 3 built the parts: the rotation
+matrix, the frequencies, the positions and the angles. This stage connects
+them. After this stage, the library can put the position of a token into its
+vector.
+
+## 3. Mathematical foundation
+
+### 3.1 The input
+
+An embedding is a vector of `d` real numbers:
+
+```text
+x = [x₀, x₁, x₂, x₃, ..., x_(d−1)]
+```
+
+`d` is even. The token of this vector has the position `m`.
+
+### 3.2 Step 1: divide the vector into pairs
+
+```text
+(x₀, x₁), (x₂, x₃), ..., (x_(d−2), x_(d−1))
+```
+
+Pair `j` is `(x₂ⱼ, x₂ⱼ₊₁)`, for `j = 0, 1, ..., d/2 − 1`.
+
+**Why pairs?** A rotation is an operation in a **plane**: a two-dimensional
+space. A rotation in two dimensions has exactly one parameter, the angle.
+Thus one pair of numbers can carry one angle: one piece of positional
+information. With `d/2` independent planes, the vector can carry `d/2`
+different angles.
+
+(A rotation in three or more dimensions needs an axis or a plane, and two
+rotations in 3-D do not commute. Pairs keep everything simple: each pair is
+an independent 2-D rotation, and 2-D rotations commute:
+`R(a)R(b) = R(b)R(a) = R(a + b)`.)
+
+### 3.3 Step 2: the angle of each pair
+
+```text
+φ(m, j) = m · θⱼ,      θⱼ = b^(−2j/d)
+```
+
+**Why a different frequency for each pair?** (Entry 7, section 3.3.) One
+speed would wrap around after about 6 positions (fast) or could not
+separate neighbours (slow). Different speeds act like the hands of a
+clock. Together they identify the position.
+
+**Why does the angle depend on the position?** The position is the
+information that RoPE must add. A constant step `θⱼ` per position makes the
+angle **linear** in `m` (Entry 9, section 3.2). Only a linear angle makes the
+rotation between two positions depend on their distance `n − m`
+(section 3.6).
+
+### 3.4 Step 3: rotate each pair
+
+```text
+x'₂ⱼ   = x₂ⱼ · cos φ − x₂ⱼ₊₁ · sin φ
+x'₂ⱼ₊₁ = x₂ⱼ · sin φ + x₂ⱼ₊₁ · cos φ        with φ = m·θⱼ
+```
+
+In matrix form, with the rotation matrix of Entry 5:
+
+```text
+[ x'₂ⱼ   ]   [ cos φ  −sin φ ] [ x₂ⱼ   ]
+[ x'₂ⱼ₊₁ ] = [ sin φ   cos φ ] [ x₂ⱼ₊₁ ]
+```
+
+**How the matrix transforms the pair.** Write the pair in polar form:
+`(x₂ⱼ, x₂ⱼ₊₁) = r·(cos α, sin α)`. Entry 5, section 3.6 showed that
+`R(φ)` gives `r·(cos(α + φ), sin(α + φ))`. The length `r` stays the same.
+The direction angle `α` increases by `φ`.
+
+For the whole vector, the `d/2` matrices form one `d × d`
+**block-diagonal** matrix. All elements outside the 2 × 2 blocks are 0:
+
+```text
+R_m = [ R(m·θ₀)    0          ...   0                ]
+      [ 0          R(m·θ₁)    ...   0                ]
+      [ ...                                          ]
+      [ 0          0          ...   R(m·θ_(d/2−1))   ]
+
+RoPE(x, m) = R_m · x
+```
+
+The implementation never builds this matrix. It would have `d²` elements,
+and almost all of them are 0. The loop over pairs does the same work with
+`d/2` small rotations.
+
+### 3.5 The complex-number interpretation (Euler's formula)
+
+View pair `j` as one complex number: `zⱼ = x₂ⱼ + i·x₂ⱼ₊₁`. Entry 6 showed
+that multiplication by `e^(iφ) = cos φ + i·sin φ` is a rotation by `φ`:
+
+```text
+zⱼ · e^(i·m·θⱼ) = (x₂ⱼ + i·x₂ⱼ₊₁)(cos φ + i·sin φ)
+                = (x₂ⱼ cos φ − x₂ⱼ₊₁ sin φ) + i·(x₂ⱼ sin φ + x₂ⱼ₊₁ cos φ)
+                = x'₂ⱼ + i·x'₂ⱼ₊₁
+```
+
+The real part is `x'₂ⱼ`. The imaginary part is `x'₂ⱼ₊₁`. Thus:
+
+> A `d`-dimensional real vector is a `d/2`-dimensional complex vector `z`.
+> RoPE multiplies component `j` of `z` by `e^(i·m·θⱼ)`.
+
+The original LLaMA code uses exactly this view. The test
+`rope_equals_complex_multiplication_per_pair` checks it bit for bit.
+
+### 3.6 Why RoPE keeps the magnitude of each pair
+
+```text
+x'₂ⱼ² + x'₂ⱼ₊₁²
+ = (x cos φ − y sin φ)² + (x sin φ + y cos φ)²                     (x = x₂ⱼ, y = x₂ⱼ₊₁)
+ = x² cos²φ − 2xy sin φ cos φ + y² sin²φ + x² sin²φ + 2xy sin φ cos φ + y² cos²φ
+ = x² (cos²φ + sin²φ) + y² (sin²φ + cos²φ)                          (the cross terms cancel)
+ = x² + y²                                                           (sin² + cos² = 1)
+```
+
+Each pair keeps its length. The squared length of the whole vector is the sum
+of the squared lengths of the pairs, so the whole vector also keeps its
+length. In the complex view: `|zⱼ · e^(iφ)| = |zⱼ| · 1 = |zⱼ|`.
+
+### 3.7 Position information without an added vector
+
+The original Transformer **adds** a position vector `p_m` to the embedding:
+`x + p_m`. This changes the length and the content of the vector. The model
+must learn to separate content from position.
+
+RoPE **multiplies** instead: `R_m · x`. It changes only the **directions**
+of the pairs, not their lengths. There is no extra vector and no trainable
+parameter. And the dot product of two rotated vectors depends only on the
+distance:
+
+```text
+(R_m u)ᵀ (R_n v) = uᵀ R_mᵀ R_n v = uᵀ R_(n−m) v
+```
+
+because each block satisfies `R(mθ)ᵀ R(nθ) = R((n − m)θ)` (Entry 5). The
+test `full_vector_dot_product_depends_only_on_the_distance` checks this for
+`d = 16`. (Stage 4 does not implement attention. This test only checks a
+property of the rotation.)
+
+### 3.8 Dimension layouts: interleaved and split-half
+
+**Our implementation uses the interleaved (adjacent-pair) layout.**
+
+| Layout | Pair `j` | `d = 4` example | Used by |
+|---|---|---|---|
+| **Interleaved** (this project) | `(x₂ⱼ, x₂ⱼ₊₁)` | `(x₀, x₁)`, `(x₂, x₃)` | RoFormer paper, original LLaMA (complex view) |
+| Split-half | `(xⱼ, x_(j+d/2))` | `(x₀, x₂)`, `(x₁, x₃)` | Hugging Face `rotate_half`, GPT-NeoX |
+
+In split-half form, the rotation is often written as:
+
+```text
+x' = x ⊙ [cos φ₀, ..., cos φ_(d/2−1), cos φ₀, ..., cos φ_(d/2−1)]
+   + rotate_half(x) ⊙ [sin φ₀, ..., sin φ_(d/2−1), sin φ₀, ..., sin φ_(d/2−1)]
+rotate_half([a, b]) = [−b, a]      (a = first half, b = second half)
+```
+
+`⊙` is element-by-element multiplication. Both layouts are valid RoPE: each
+pair rotates by `m·θⱼ`, so all invariants (length, relative position) hold.
+But they give **different numbers** for the same input, because they pair
+different components. The two layouts are related by a fixed permutation of
+the components. A model trained with one layout must use that layout. When
+we compare with an external implementation (Stage 7), we must first convert
+the layout.
+
+We did not implement split-half. One layout keeps the code and the tests
+simple. Adding it later needs only a different way to select the two
+components of pair `j`.
+
+### 3.9 Complete numerical example: `d = 8`, `b = 10000`, `m = 1`
+
+**Input:** `x = [1, 2, 3, 4, 5, 6, 7, 8]`.
+
+**Frequencies** (Entry 7): `θ = [1, 0.1, 0.01, 0.001]`.
+**Angles at `m = 1`:** `φ = 1·θ = [1, 0.1, 0.01, 0.001]`.
+
+**Pair 0: `(x₀, x₁) = (1, 2)`, `φ = 1`.**
+
+```text
+cos 1 = 0.5403023,   sin 1 = 0.8414710
+x'₀ = 1·0.5403023 − 2·0.8414710 = 0.5403023 − 1.6829420 = −1.1426397
+x'₁ = 1·0.8414710 + 2·0.5403023 = 0.8414710 + 1.0806046 =  1.9220756
+check: (−1.1426397)² + 1.9220756² = 1.3056255 + 3.6943746 = 5.0000001 ≈ 5 = 1² + 2²
+```
+
+**Pair 1: `(x₂, x₃) = (3, 4)`, `φ = 0.1`.**
+
+```text
+cos 0.1 = 0.9950042,   sin 0.1 = 0.0998334
+x'₂ = 3·0.9950042 − 4·0.0998334 = 2.9850125 − 0.3993337 = 2.5856788
+x'₃ = 3·0.0998334 + 4·0.9950042 = 0.2995002 + 3.9800167 = 4.2795169
+check: 2.5856788² + 4.2795169² = 6.6857349 + 18.3142649 = 24.9999998 ≈ 25 = 3² + 4²
+```
+
+**Pair 2: `(x₄, x₅) = (5, 6)`, `φ = 0.01`.**
+
+```text
+cos 0.01 = 0.9999500,   sin 0.01 = 0.0099998
+x'₄ = 5·0.9999500 − 6·0.0099998 = 4.9997500 − 0.0599990 = 4.9397510
+x'₅ = 5·0.0099998 + 6·0.9999500 = 0.0499992 + 5.9997000 = 6.0496992
+check: 4.9397510² + 6.0496992² = 24.4011399 + 36.5988604 = 61.0000004 ≈ 61 = 5² + 6²
+```
+
+**Pair 3: `(x₆, x₇) = (7, 8)`, `φ = 0.001`.**
+
+```text
+cos 0.001 = 0.9999995,   sin 0.001 = 0.0010000 (more exactly 0.00099999983)
+x'₆ = 7·0.9999995 − 8·0.0010000 = 6.9999965 − 0.0080000 = 6.9919965
+x'₇ = 7·0.0010000 + 8·0.9999995 = 0.0070000 + 7.9999960 = 8.0069960
+check: 6.9919965² + 8.0069960² = 48.8880151 + 64.1119849 = 113.0000000 = 7² + 8²
+```
+
+The small differences (for example `24.9999998`) come from the rounding of
+the 7-decimal values in this hand calculation. The program calculates with
+`f64` and gets the lengths within `1e−14`.
+
+**Result:**
+
+```text
+x' = [−1.1426397, 1.9220756, 2.5856788, 4.2795169, 4.9397510, 6.0496992, 6.9919965, 8.0069960]
+‖x‖² = 5 + 25 + 61 + 113 = 204 = ‖x'‖²
+```
+
+**Observations:**
+
+- Pair 0 (fast) changed a lot: its angle increased by 1 rad ≈ 57°.
+- Pair 3 (slow) changed very little: its angle increased by 0.001 rad
+  ≈ 0.06°.
+- Every pair kept its length. The total length is the same.
+
+**Complex check of pair 0:** `(1 + 2i)·e^(i·1) = (cos 1 − 2 sin 1) +
+i(sin 1 + 2 cos 1) = −1.1426397 + 1.9220756i`. The same values.
+
+**Position 0:** all angles are 0, so `x' = x` exactly.
+**Position 2:** the angles are `[2, 0.2, 0.02, 0.002]`. Pair 0 becomes
+`(−2.2347417, 0.0770038)`.
+
+### 3.10 Numerical precision
+
+- **Position 0 is exact.** `cos 0 = 1` and `sin 0 = 0` exactly in IEEE 754.
+  Thus `x·1 − y·0 = x` exactly. The test uses `assert_eq!`.
+- **The length error** is a few `ε` (`f64::EPSILON ≈ 2.2e−16`) for every
+  position, because `cos²φ + sin²φ` is 1 within a few `ε` for every
+  `φ`. We measured a squared-norm error of at most `1.1e−14` for
+  `‖x‖² ≈ 20` and positions up to `1.3 × 10⁷`.
+- **The composition error grows with the position.**
+  `RoPE(RoPE(x, m), n)` and `RoPE(x, m + n)` use the angles
+  `m·θ + n·θ` and `(m + n)·θ`. Each has an absolute rounding error of about
+  `(m + n)·ε`. We measured the largest component difference:
+
+  | `m + n` | 13 | 1 333 | 133 333 | 1 333 333 | 13 333 333 |
+  |---|---|---|---|---|---|
+  | max difference | 4.4e−16 | 2.2e−14 | 2.6e−12 | 3.9e−11 | 3.3e−11 |
+
+  The test `invariant_e_large_positions_and_bases` uses the bound
+  `4·ε·(m + n + 10)·max|x|`. This bound follows from the error model and
+  passes for all bases that we tested.
+- Thus: the **length** is always safe. The **exact angle** at very large
+  positions has an error that grows linearly with `m`. In `f32`, this error
+  is about `5 × 10⁸` times larger (Entry 9, section 3.8).
+
+### 3.11 Where a Transformer uses this
+
+A Transformer applies this transformation to the **query** and **key**
+vectors of every attention head, at the position of their token, before it
+calculates the attention scores. Stage 5 implements this.
+
+## 4. Rust concepts learned
+
+### 4.1 Slices: `&[f64]` and `&mut [f64]`
+
+A **slice** is a view into a sequence of values that somebody else owns. It
+is a pointer and a length (16 bytes). `&[f64]` allows reading. `&mut [f64]`
+allows reading and writing.
+
+```rust
+let v = vec![1.0, 2.0, 3.0, 4.0];
+let all: &[f64] = &v;          // the whole Vec
+let part: &[f64] = &v[1..3];   // [2.0, 3.0], no copy
+```
+
+`rotate` takes `&[f64]`. Thus the caller can pass a `Vec`, an array, or a
+part of a larger buffer. The test `rotate_in_place_works_on_a_sub_slice`
+rotates 4 values in the middle of a 6-value array.
+
+**The borrow rules.** At one time, a value can have **either** many `&`
+borrows **or** one `&mut` borrow. Thus, while `rotate_in_place` holds
+`&mut embedding`, no other code can read or change it. This prevents data
+races at compile time.
+
+### 4.2 `chunks_exact(2)` and `chunks_exact_mut(2)`
+
+```rust
+let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+let mut chunks = v.chunks_exact(2);
+assert_eq!(chunks.next(), Some(&[1.0, 2.0][..]));
+assert_eq!(chunks.next(), Some(&[3.0, 4.0][..]));
+assert_eq!(chunks.next(), None);
+assert_eq!(chunks.remainder(), &[5.0]);   // the incomplete chunk
+```
+
+`chunks_exact(n)` is an iterator over non-overlapping sub-slices of exactly
+`n` elements. If the length is not a multiple of `n`, the last incomplete
+part goes to `remainder()`. (`chunks(n)` instead would return the short last
+chunk as a normal item.)
+
+For RoPE, `n = 2` gives exactly the adjacent pairs. We validate the length
+first (`d` is even), so the remainder is always empty.
+
+`chunks_exact_mut(2)` gives `&mut [f64]` sub-slices. The borrow checker
+accepts many mutable chunks at the same time, because the chunks do not
+overlap.
+
+We use `chunks_exact` and not `chunks`, because "exactly 2" lets the
+compiler know the length of every chunk. Then it can remove the bounds
+checks of `pair[0]` and `pair[1]`.
+
+### 4.3 How the iterators process the pairs: `zip`
+
+```rust
+for (pair, &theta) in embedding.chunks_exact_mut(2).zip(&self.inverse_frequencies) {
+    let phi = angle_unchecked(position, theta);
+    let rotated = rotate_pair([pair[0], pair[1]], phi);
+    pair.copy_from_slice(&rotated);
+}
+```
+
+`a.zip(b)` creates one iterator from two. Each item is a tuple `(itemA,
+itemB)`. It stops when the **shorter** iterator ends. Here, both have
+`d/2` items:
+
+```text
+chunks_exact_mut(2): [x0,x1]  [x2,x3]  [x4,x5]  [x6,x7]
+&inverse_frequencies:  &θ₀      &θ₁      &θ₂      &θ₃
+zip:                 ([x0,x1],&θ₀) ([x2,x3],&θ₁) ...
+```
+
+The pattern `(pair, &theta)` takes the tuple apart and copies the `f64`
+out of the reference `&θⱼ`.
+
+`&self.inverse_frequencies` is `&Vec<f64>`. `zip` accepts anything that
+can become an iterator (`IntoIterator`). `&Vec<f64>` becomes an iterator over
+`&f64`.
+
+### 4.4 `enumerate()` as an alternative to `zip`
+
+The same loop with an explicit pair index `j`:
+
+```rust
+for (j, pair) in embedding.chunks_exact_mut(2).enumerate() {
+    let theta = self.inverse_frequencies[j];   // indexed access, bounds check
+    // ...
+}
+```
+
+`enumerate()` gives `(0, item0), (1, item1), ...`. This is useful when we
+need `j` itself (the tests use it to print the pair index). In the main
+loop we do not need `j`, only `θⱼ`. `zip` gives `θⱼ` directly, without an
+index and without a bounds check. Both versions produce the same machine
+code in practice.
+
+### 4.5 `copy_from_slice`
+
+`pair.copy_from_slice(&rotated)` copies the two values of the array
+`rotated` into the two slots of `pair`. It panics if the lengths differ; here
+both are 2. It is the same as `pair[0] = rotated[0]; pair[1] = rotated[1];`.
+
+### 4.6 Ownership of the returned vector
+
+```rust
+pub fn rotate(&self, embedding: &[f64], position: Position) -> Result<Vec<f64>, RopeError> {
+    validate_embedding_dimension(embedding.len(), self.dimension())?;
+    let mut output = embedding.to_vec();
+    self.rotate_pairs(&mut output, position);
+    Ok(output)
+}
+```
+
+1. `embedding` is borrowed. The caller still owns it.
+2. `to_vec()` allocates a new `Vec` and copies the `d` values. The function
+   owns `output`.
+3. `rotate_pairs(&mut output, ...)` borrows `output` mutably for the loop.
+   The borrow ends when the call returns.
+4. `Ok(output)` **moves** `output` to the caller. Only the 24-byte header
+   moves. The heap data stays where it is. The caller now owns it.
+
+### 4.7 When cloning is necessary, and when it is not
+
+- **Necessary:** in `rotate`. The caller keeps the input and gets a new
+  output. Two vectors exist, so one copy (`to_vec`) is unavoidable.
+- **Not necessary:** in `rotate_in_place`. The caller gives up the old
+  values. The function writes into the existing memory.
+- **Not necessary:** the frequencies. `RotaryEmbedding` owns them. Each call
+  borrows them (`&self`). They are never copied.
+- **Not necessary:** a pair. `[f64; 2]` is `Copy`. `rotate_pair` receives a
+  copy on the stack, not a heap clone.
+- **In tests:** `x.clone()` is necessary only when a test needs the
+  original and the in-place result at the same time.
+
+### 4.8 `pub(crate)`
+
+`angle_unchecked` in `frequencies.rs` is `pub(crate)`: visible in the whole
+crate, invisible to users of the library. The embedding code can use the
+one angle formula without the `Result` of the public `angle` function. Its
+frequencies come from a validated `RopeConfig`, so a check would be useless
+work.
+
+### 4.9 A struct that caches derived data
+
+`RotaryEmbedding` keeps `inverse_frequencies: Vec<f64>`. They are
+**derived** from `config`. The struct calculates them one time in `new`.
+The fields are private, so nobody can change the frequencies without the
+configuration. This is the reason for the struct: "do not repeat frequency
+calculations unnecessarily".
+
+## 5. Memory and execution
+
+| Value | Size | Location |
+|---|---|---|
+| `RotaryEmbedding` | 40 B (16 B config + 24 B `Vec` header) + `d/2·8` B | stack + heap |
+| input of `rotate` | not copied until `to_vec` | borrowed |
+| output of `rotate` | 24 B header + `d·8` B | stack + heap (one allocation) |
+| a pair inside the loop | 16 B | registers |
+
+**Complete execution flow of `rope.rotate(&x, m)`:**
+
+```text
+1. validate_embedding_dimension(x.len(), d)  → Err(...) returns early, no allocation
+2. output = x.to_vec()                        → one heap allocation of d·8 bytes, copy
+3. rotate_pairs(&mut output, m):
+     for each (pair j, θⱼ):                   → d/2 iterations
+        φ = m as f64 · θⱼ                     → 1 multiplication
+        (sin φ, cos φ) = sin_cos(φ)           → 1 trigonometric call (inside rotate_vector)
+        [a, b] = [x·cos − y·sin, x·sin + y·cos] → 4 multiplications, 2 additions
+        write a, b into the same two slots
+4. Ok(output)                                  → move to the caller
+```
+
+`rotate_in_place` is the same without step 2 and with a move of nothing.
+
+**When values go out of scope:** the caller's output `Vec` is dropped when
+its variable goes out of scope; `drop` frees the `d·8` bytes. The pairs and
+angles in the loop are stack or register values; they need no cleanup.
+
+## 6. Engineering decisions
+
+1. **`rotate_pair` calls `math::matrix::rotate_vector`.** The rotation
+   formula exists once. The RoPE module only adds the RoPE name and
+   documentation.
+2. **A struct `RotaryEmbedding`.** It computes the frequencies once. A free
+   function `rope(config, x, m)` would recompute `d/2` powers per call.
+3. **Two methods: new vector and in place.** `rotate` is convenient and
+   safe (the input stays). `rotate_in_place` avoids the allocation. Both use
+   one private loop (`rotate_pairs`), so the logic is not duplicated.
+4. **Validation before allocation.** An invalid input costs nothing.
+5. **No check of the component values.** NaN or infinity stays in its own
+   pair (test `non_finite_values_stay_in_their_pair`). A check would cost
+   `d` comparisons per call, and RoPE cannot repair bad values.
+6. **One layout (interleaved).** It matches the mathematics most directly.
+   Split-half is documented, not implemented.
+7. **No new configuration option.** See `config.rs`: `d` and `b` are
+   sufficient.
+8. **A new error variant `EmbeddingDimensionMismatch`.** It contains the
+   expected and the actual length.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Build the `d × d` block-diagonal matrix | Direct matrix view | `d²` memory and `d²` multiplications; almost all zeros |
+| Use `Complex` for each pair | Matches the LLaMA code | Needs conversion from and to `f64` pairs; the same arithmetic |
+| An iterator chain with `flat_map` + `collect` for `rotate` | No `to_vec` + overwrite | `flat_map` does not report an exact length, so `collect` may reallocate; harder to read |
+| Only `rotate_in_place` | No allocation at all | The caller must clone manually if it needs the original |
+| Return `[f64; D]` with const generics | No heap | `d` is a run-time value |
+| A `cos`/`sin` cache per position | No trigonometry per call | Memory `L·d/2·16` bytes; premature now (Stage 6) |
+| Split-half layout | Matches Hugging Face weights | Not needed for learning now |
+
+## 8. Performance considerations
+
+- **Time:** `O(d)` per vector: `d/2` iterations.
+- **Trigonometry:** `d/2` `sin_cos` calls per vector. This is the main cost
+  (about 20 to 100 cycles each). The arithmetic is 5 multiplications and 2
+  additions per pair.
+- **Space:** `rotate`: `d·8` bytes for the output (one allocation).
+  `rotate_in_place`: no allocation. The struct: `d/2·8` bytes of
+  frequencies, allocated once.
+- **Can sine and cosine be reused?** Yes. `cos(m·θⱼ)` and `sin(m·θⱼ)` depend
+  only on `m` and `j`, not on the vector. All vectors at the same position
+  (all heads, all layers, queries and keys) use the same values. A table of
+  `L·d/2` pairs `(cos, sin)` removes all trigonometry from the inner loop.
+  This is the "RoPE cache" of many implementations. We do not build it now.
+- **Does in place reduce allocations?** Yes: from one per call to zero.
+  For many vectors, the allocation (about 20 to 100 ns) can cost as much as
+  the arithmetic for small `d`.
+- **Later optimizations:** the `cos`/`sin` cache; SIMD (Single Instruction,
+  Multiple Data) over several pairs; batches of vectors in one contiguous
+  buffer (Stage 5 prepares this); `f32` with care for large positions.
+
+## 9. Practical example
+
+```rust
+use rust_rope::rope::config::RopeConfig;
+use rust_rope::rope::embeddings::RotaryEmbedding;
+use rust_rope::rope::position::Position;
+
+let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0)?);
+let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+println!("{:?}", rope.rotate(&x, Position::new(1)?)?);
+
+let mut v = x;                                   // `[f64; 8]` is Copy
+rope.rotate_in_place(&mut v, Position::new(1)?)?;
+println!("{v:?}");
+
+println!("{}", rope.rotate(&[1.0, 2.0, 3.0], Position::ZERO).unwrap_err());
+```
+
+Expected output (from `cargo run --example basic_rope`):
+
+```text
+[-1.1426396637476532, 1.922075596544176, 2.585678829246765, 4.279516911052588, 4.939751002078326, 6.049699169170825, 6.991996501333625, 8.006995998833666]
+[-1.1426396637476532, 1.922075596544176, 2.585678829246765, 4.279516911052588, 4.939751002078326, 6.049699169170825, 6.991996501333625, 8.006995998833666]
+the embedding has 3 components, but the RoPE configuration has the dimension 8
+```
+
+## 10. Test results and what we learned
+
+**Test results** (`cargo test`, 2026-11-01): all tests pass. New Stage 4
+tests:
+
+- Unit tests: 7 in `rotations.rs`, 7 in `embeddings.rs`, 1 in
+  `validation.rs`.
+- `tests/rope_tests.rs`: 13 new API tests (`d = 2, 4, 8`, the worked
+  example, positions 0 and 1, positions 0..9, bases, invalid lengths, zero
+  vector, negative values, new vector versus in place, sub-slices).
+- `tests/numerical_tests.rs`: 10 new invariant tests: A (position 0), B
+  (pair lengths), C (composition, pair and vector form), D (each pair gets
+  `m·θⱼ`), E (large positions and bases), complex form, linearity, relative
+  dot product, inverse rotation.
+
+**Mathematics:**
+
+- RoPE divides `x` into `d/2` adjacent pairs and rotates pair `j` by
+  `m·θⱼ`. As one matrix, this is block-diagonal: `R_m = diag(R(m·θⱼ))`.
+- In complex form: `zⱼ ↦ zⱼ·e^(i·m·θⱼ)`.
+- Each pair keeps its length: the cross terms cancel, and
+  `sin² + cos² = 1`.
+- RoPE multiplies instead of adds: it changes directions, not lengths, and
+  needs no parameters.
+- `(R_m u)ᵀ(R_n v) = uᵀ R_(n−m) v`: only the distance counts.
+- Interleaved and split-half layouts are both valid but not interchangeable.
+- The length is always exact within a few `ε`; the angle error grows with
+  `m`.
+
+**Rust:**
+
+- Slices `&[f64]` / `&mut [f64]` borrow a part of memory without copying.
+- `chunks_exact_mut(2)` gives non-overlapping mutable pairs; `zip` walks
+  pairs and frequencies together; `enumerate` adds an index when needed.
+- `to_vec` is the one necessary copy for a new output; an in-place version
+  needs no allocation.
+- Returning a `Vec` moves only its header.
+- `pub(crate)` shares an internal helper inside the crate.
+- A struct can own derived data (the frequencies) so that it is computed
+  once.
+
+
+---
+
+# Entry 11 — Attention tensor shapes and the flat `Tensor4` (Stage 5, Component A)
+
+**Date:** 2026-11-01
+**Stage:** 5 (RoPE with query and key tensors)
+**Files:** `src/math/tensor.rs` (new), `src/math/mod.rs`,
+`tests/rope_tests.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `TensorShape { batch, sequence, heads, features }` | ✅ Implemented |
+| `Tensor4`: `new`, `zeros`, `from_fn`, `index`, `get`, `get_mut`, `vector`, `vector_mut`, `as_slice`, `as_mut_slice`, `into_vec` | ✅ Implemented |
+| `TensorError` (zero extent, overflow, length mismatch) | ✅ Implemented |
+| Learned projections `W_Q`, `W_K`, `W_V`, softmax, masking | ❌ Not implemented (outside the scope) |
+| Strided views, transposes, general N-D tensors | ❌ Not implemented (not needed) |
+
+**Note on the stage numbering (2026-11-01).** The roadmap in Entry 1 and
+the README had "Stage 5 = Advanced RoPE (scaling)". The project owner
+redefined the stages: Stage 5 = query/key integration, Stage 6 = PyTorch
+reference validation, Stage 7 = layouts and partial RoPE, Stage 8 =
+scaling, Stage 9 = CPU performance. Older entries keep their original
+stage numbers.
+
+---
+
+## 1. What did we build?
+
+We built a four-dimensional array type, `Tensor4`. It stores the values of
+the logical shape `[B, S, H, D]` in **one** flat `Vec<f64>`. It calculates
+the position of each element with an index formula.
+
+## 2. Why did we build it?
+
+A Transformer does not rotate one vector at a time. It rotates all query
+and key vectors of all heads, of all tokens, of all sequences in a batch.
+These vectors form a four-dimensional tensor. We need a container for this
+data before we can apply RoPE to it (Entry 12).
+
+## 3. Mathematical foundation
+
+### 3.1 Tensors
+
+A **tensor** here is a multi-dimensional array of numbers. A vector is a
+1-D tensor (one index). A matrix is a 2-D tensor (two indices: row,
+column). A 4-D tensor has four indices. The **shape** lists the number of
+values along each index (each **axis**). Example: shape `[2, 4, 2, 4]` has
+`2·4·2·4 = 64` values.
+
+### 3.2 Input hidden states: `X ∈ R^(B × S × D_model)`
+
+- **Batch size `B`.** A model processes several independent sequences
+  together (a **batch**), because this uses the hardware better. Sequence
+  `b` never influences sequence `b' ≠ b` in attention.
+- **Sequence length `S`.** The number of tokens in each sequence. Token
+  `s = 0, 1, ..., S − 1`.
+- **Hidden dimension `D_model`.** The length of the vector for one token.
+- **Hidden state.** The vector `X[b, s, :]` (all `D_model` values of token
+  `s` in sequence `b`). It represents the token **in its context**: the
+  first layer receives the token embedding; each later layer receives the
+  output of the previous layer.
+
+**Example.** `B = 2` sentences, `S = 4` tokens each, `D_model = 8`:
+
+```text
+X[0] = "the cat sat down":   4 tokens × 8 numbers
+X[1] = "a dog ran fast":     4 tokens × 8 numbers
+X[0, 1, :] = hidden state of "cat", for example
+           = [0.1, −0.3, 0.7, 0.2, −0.5, 0.4, 0.0, 0.9]
+```
+
+`X` has `2 · 4 · 8 = 64` numbers.
+
+### 3.3 Query, key and value projections
+
+```text
+Q = X·W_Q,      K = X·W_K,      V = X·W_V,      W_Q, W_K, W_V ∈ R^(D_model × D_model)
+```
+
+The product is applied to every token vector: `Q[b, s, :] = X[b, s, :]·W_Q`.
+
+- **Query `q`** ("what does this token look for?"). It is compared with all
+  keys.
+- **Key `k`** ("what does this token offer for the comparison?"). The
+  attention score of query token `m` and key token `n` is the dot product
+  `q_mᵀ k_n` (scaled by `1/√D` and normalized by softmax in a full model).
+- **Value `v`** ("what information does this token give?"). The output of
+  attention for token `m` is a weighted sum of the values `v_n`, with the
+  weights from the scores.
+- **The projection matrices** `W_Q`, `W_K`, `W_V` are learned parameters.
+  Each one is a linear map: it selects and mixes the features of the hidden
+  state for its role. We do not implement or train them. RoPE starts
+  **after** the projections.
+
+### 3.4 Multi-head shapes
+
+**Multi-head attention** runs `H` attention operations ("heads") in
+parallel. Each head uses its own part of the projected vector:
+
+```text
+D_model = H · D        (D = head dimension)
+```
+
+Example: `D_model = 8`, `H = 2` → `D = 4`. The projected query of one token,
+`[q₀, q₁, ..., q₇]`, is divided into:
+
+```text
+head 0: [q₀, q₁, q₂, q₃]        head 1: [q₄, q₅, q₆, q₇]
+```
+
+The **reshape** `[B, S, D_model] → [B, S, H, D]` only **reinterprets** the
+indices. The values stay in the same memory order. Hidden index `c` becomes
+`(h, d)` with `c = h·D + d`. Thus the reshape costs nothing.
+
+For the task example, `B = 2, S = 4, H = 2, D = 4`:
+
+```text
+Q, K, V ∈ R^(2 × 4 × 2 × 4)
+axis 0 (b): which sequence      0..2
+axis 1 (s): which token         0..4  → the token position m = start + s
+axis 2 (h): which head          0..2
+axis 3 (d): which feature       0..4  → RoPE pairs (d₀, d₁), (d₂, d₃)
+```
+
+### 3.5 Flat storage: derivation of the index formula
+
+We store the values in **row-major** order: the last index changes fastest.
+Count how many values come before element `(b, s, h, d)`:
+
+1. Before batch element `b`: `b` complete batch elements, each with
+   `S·H·D` values → `b·S·H·D`.
+2. Inside batch element `b`, before token `s`: `s` complete tokens, each
+   with `H·D` values → `s·H·D`.
+3. Inside token `s`, before head `h`: `h` complete heads, each with `D`
+   values → `h·D`.
+4. Inside head `h`, before feature `d`: `d` values.
+
+```text
+index = b·S·H·D + s·H·D + h·D + d
+      = ((b·S + s)·H + h)·D + d            (factor out D, then H, then S)
+```
+
+The second form is the **Horner form**: it needs only 3 multiplications and
+3 additions.
+
+**Example** (`S = 4, H = 2, D = 4`): element `(b, s, h, d) = (1, 2, 1, 3)`:
+
+```text
+((1·4 + 2)·2 + 1)·4 + 3 = (6·2 + 1)·4 + 3 = 13·4 + 3 = 55
+check: 1·32 + 2·8 + 1·4 + 3 = 32 + 16 + 4 + 3 = 55
+```
+
+The last element `(1, 3, 1, 3)` has index `63 = 64 − 1`.
+
+**Strides.** The **stride** of an axis is the index step for a step of 1
+on that axis: `d` → 1, `h` → `D`, `s` → `H·D`, `b` → `S·H·D`. For the
+example: strides `[32, 8, 4, 1]`.
+
+### 3.6 Memory layout and cache locality
+
+```text
+memory: [ b0 s0 h0 (4 values) | b0 s0 h1 (4) | b0 s1 h0 (4) | ... | b1 s3 h1 (4) ]
+          └── one head vector: contiguous ──┘
+          └──────── one token: H·D = 8 contiguous values ────────┘
+```
+
+The processor loads memory in **cache lines** (usually 64 bytes = 8 `f64`).
+When code reads memory in increasing order, each cache line is used
+completely, and the hardware **prefetcher** loads the next lines early. This
+is **spatial locality**. RoPE reads one head vector (`D` contiguous values)
+at a time, and our loop visits the head vectors in memory order. Thus the
+traversal is a single sequential pass.
+
+## 4. Rust concepts learned
+
+### 4.1 Structs with a private `Vec` and a public shape
+
+`Tensor4 { shape: TensorShape, data: Vec<f64> }` has private fields. Thus
+the invariant `data.len() == B·S·H·D` can only be created by the checked
+constructors. `TensorShape` has public fields, because a shape alone has no
+invariant.
+
+### 4.2 Ownership in `new`
+
+```rust
+pub fn new(shape: TensorShape, data: Vec<f64>) -> Result<Self, TensorError>
+```
+
+`data: Vec<f64>` (not `&[f64]`) means the function **takes ownership**. The
+`Vec` header (24 bytes) moves into the struct. The heap buffer does not
+move or copy. After the call, the caller cannot use its variable:
+
+```rust
+let v = vec![0.0; 4];
+let t = Tensor4::new(TensorShape::new(1, 1, 1, 4), v)?;
+// println!("{v:?}");   // error[E0382]: borrow of moved value: `v`
+```
+
+`into_vec(self)` does the reverse: it consumes the tensor and returns the
+buffer, again without a copy.
+
+### 4.3 Borrowing and mutable references
+
+- `get(&self, ...) -> Option<f64>` returns a copy of one value.
+- `get_mut(&mut self, ...) -> Option<&mut f64>` returns a **mutable
+  reference**: a pointer through which the caller can write
+  (`*x = 7.5`). While it exists, the whole tensor is mutably borrowed. The
+  compiler rejects any other access to the tensor during that time.
+- `vector(&self, b, s, h) -> Option<&[f64]>` returns a slice that borrows
+  the tensor. `vector_mut` returns `&mut [f64]`.
+
+A test showed this rule in practice. This test did not compile:
+
+```rust
+assert_eq!((q2, k2), (q3, k3));   // moves q3 and k3 into a tuple
+r.rotate_tensor_in_place(&mut single, ...);
+assert_eq!(single, q3);            // error[E0382]: borrow of moved value: `q3`
+```
+
+The fix compares references: `assert_eq!((&q2, &k2), (&q3, &k3))`.
+
+### 4.4 `Option` for out-of-range indices
+
+`index(b, s, h, d)` checks every index against its extent. A check of only
+the final flat index is **not** sufficient: with `D = 4`, `(0, 0, 0, 5)`
+gives the flat index 5, which is valid, but it is the element
+`(0, 0, 1, 1)`. The unit test `out_of_range_indices_return_none` checks this.
+
+### 4.5 Errors in `math` without `utils`
+
+The architecture rule says that `math` does not depend on `rope` or
+`utils`. Thus `tensor.rs` has its own error enum, `TensorError`. The axis
+name in `ZeroExtent { axis: &'static str }` is a **string literal**: a
+`&'static str` lives for the whole program, so the error can store it
+without an allocation.
+
+### 4.6 `from_fn` with `impl FnMut`
+
+```rust
+pub fn from_fn(shape: TensorShape, mut f: impl FnMut(usize, usize, usize, usize) -> f64)
+```
+
+`impl FnMut(...)` accepts any closure with this signature. The compiler
+creates one copy of `from_fn` for each closure type (**monomorphization**),
+so the call `f(b, s, h, d)` is direct and can be inlined. `FnMut` (not `Fn`)
+allows the closure to change captured variables. The unit test
+`index_formula_matches_memory_order` uses a counter inside the closure; this
+also proves that `from_fn` visits the elements in memory order.
+
+### 4.7 Checked multiplication of the shape
+
+`B·S·H·D` can overflow. `num_elements` uses `checked_mul` three times with
+`?` on `Option`. Every extent must also be at least 1: a zero extent would
+make `chunks_exact_mut(0)` panic in the RoPE loop.
+
+## 5. Memory and execution
+
+| Value | Size | Location |
+|---|---|---|
+| `TensorShape` | 32 B | stack (`Copy`) |
+| `Tensor4` | 56 B (32 shape + 24 `Vec` header) | stack |
+| data | `B·S·H·D·8` B | heap, one block |
+
+Example sizes: `[2, 4, 2, 4]` → 512 B. `[2, 512, 16, 64]` → 8 MiB.
+
+## 6. Engineering decisions
+
+1. **A new module `math/tensor.rs`.** A 4-D array is a general data
+   structure, not RoPE logic, and no existing `math` module fits it.
+2. **No tensor framework** (for example `ndarray`). The standard library is
+   sufficient for one fixed rank and row-major order.
+3. **Named axes in `TensorShape`** instead of `[usize; 4]`: `shape.heads` is
+   clearer than `shape[2]` and prevents axis mix-ups.
+4. **Fixed rank 4.** Rank-generic code (const generics) adds complexity
+   without a current need.
+5. **Zero extents are errors** (see 4.7).
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `Vec<Vec<Vec<Vec<f64>>>>` | Natural `t[b][s][h][d]` syntax; ragged shapes possible | `B·S·H + B·S + B + 1` heap allocations; pointer chasing; the rows can be anywhere in memory; no single slice for SIMD or for a GPU copy; the shape can become inconsistent |
+| Flat `Vec<f64>` (our choice) | One allocation; contiguous; any sub-block is a slice; matches the layout of PyTorch, NumPy and GPU buffers; one `memcpy` to move to another device | Index arithmetic in code; the shape must be validated |
+| `ndarray` crate | General N-D, strides, views | External dependency |
+| `[[[[f64; D]; H]; S]; B]` | No heap; compile-time shape | Sizes must be constants; large arrays overflow the stack |
+
+**Why the flat representation helps later CPU and GPU optimization.** SIMD
+instructions load several contiguous values at once. A thread pool can give
+each thread a contiguous sub-slice (`chunks_mut`) without any overlap. A GPU
+copy is one contiguous transfer. None of this is possible with nested `Vec`s
+without first copying into a flat buffer.
+
+## 8. Performance considerations
+
+- `index`: 4 comparisons + 3 multiplications + 3 additions.
+- `from_fn`: one allocation, `B·S·H·D` sequential `push` operations.
+- `vector(b, s, h)`: no copy; one slice of `D` values.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::tensor::{Tensor4, TensorShape};
+
+let t = Tensor4::from_fn(TensorShape::new(2, 4, 2, 4), |b, s, h, d| {
+    (1000 * b + 100 * s + 10 * h + d) as f64
+})?;
+println!("{:?}", t.index(1, 2, 1, 3));      // Some(55)
+println!("{:?}", t.get(1, 2, 1, 3));        // Some(1213.0)
+println!("{:?}", t.vector(0, 1, 1));        // Some([110.0, 111.0, 112.0, 113.0])
+println!("{:?}", t.index(0, 0, 0, 4));      // None
+```
+
+## 10. What we learned
+
+**Mathematics:** hidden states `[B, S, D_model]`; projections `Q = XW_Q`,
+`K = XW_K`, `V = XW_V`; `D_model = H·D`; the reshape into heads is a
+reinterpretation of indices; the row-major index
+`((b·S + s)·H + h)·D + d` and the strides `[S·H·D, H·D, D, 1]`.
+
+**Rust:** a struct with a private `Vec` keeps a shape invariant; `new`
+takes ownership of the buffer without copying; `&mut f64` and `&mut [f64]`
+borrow mutably; `Option` for safe indexing; `impl FnMut` and
+monomorphization; `&'static str` in an error.
+
+---
+
+# Entry 12 — RoPE on query and key tensors; relative position in attention scores (Stage 5, Components B and C)
+
+**Date:** 2026-11-01
+**Stage:** 5
+**Files:** `src/rope/embeddings.rs` (new methods),
+`src/utils/validation.rs` (`QueryKeyShapeMismatch`),
+`tests/rope_tests.rs`, `tests/numerical_tests.rs`,
+`benches/rope_benchmark.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `RotaryEmbedding::rotate_tensor_in_place(&mut Tensor4, start)` | ✅ Implemented |
+| `RotaryEmbedding::rotate_query_key_in_place(&mut q, &mut k, start)` | ✅ Implemented |
+| `RotaryEmbedding::rotate_query_key(&q, &k, start) -> (q', k')` | ✅ Implemented |
+| Configurable start position | ✅ Implemented |
+| Value tensor unchanged (no value parameter) | ✅ Implemented and tested |
+| Simple `std::time` benchmark | ✅ Implemented |
+| Softmax, masking, KV cache, projections | ❌ Not implemented (outside the scope) |
+
+---
+
+## 1. What did we build?
+
+We apply RoPE to every query and key head vector of `[B, S, H, D]`
+tensors. The token at sequence index `s` has the position `m = start + s`.
+The value tensor is not an input, so it cannot change.
+
+## 2. Why did we build it?
+
+This is where RoPE does its work in a Transformer: on queries and keys,
+just before the attention scores. Section 3.4 proves that this makes every
+score depend only on the relative distance of the two tokens.
+
+## 3. Mathematical foundation
+
+### 3.1 The operation
+
+For every `b`, every `s` (position `m = start + s`) and every `h`:
+
+```text
+Q'[b, s, h, :] = R_m · Q[b, s, h, :]
+K'[b, s, h, :] = R_m · K[b, s, h, :]
+V'             = V                           (unchanged)
+```
+
+`R_m = diag(R(m·θ₀), ..., R(m·θ_(D/2−1)))` is the block-diagonal matrix of
+Entry 10. `D` is the head dimension.
+
+### 3.2 The same frequencies for all heads
+
+`θⱼ = b^(−2j/D)` depends only on `D` and `b`. All heads have the same `D`
+and use the same configuration. Thus all heads, all batch elements, the
+queries and the keys use **the same** `θⱼ`, and at one position `m`, the
+same matrix `R_m`. `RotaryEmbedding` stores `θⱼ` one time.
+
+What differs between heads is the **content** of the vectors (each head has
+its own part of `W_Q` and `W_K`), not the rotation.
+
+### 3.3 Why queries and keys, but not values
+
+Attention uses the vectors in two different ways:
+
+1. **Scores** compare a query with a key: `q_mᵀ k_n`. This is where the
+   relation between two positions matters.
+2. **Outputs** mix the values: `out_m = Σₙ wₘₙ · v_n`, with weights `wₘₙ`
+   from the scores.
+
+Standard RoPE is **designed** to put position information into the scores,
+and only there. If both `q_m` and `k_n` are rotated, the score depends on
+`n − m` (section 3.4). The values carry content; the weights already
+contain the position information.
+
+Rotating the values is mathematically possible. It would be a different
+design. It would make the output of token `m` a mix of vectors rotated by
+the absolute positions `n` of the other tokens, so the output would carry
+absolute position information, which is what RoPE wants to avoid. Standard
+RoPE (RoFormer, LLaMA and most models) does not do this. Our API makes the
+standard design explicit: there is no value parameter.
+
+### 3.4 Derivation of the relative-position property
+
+Let `Q'_m = R(m)·Q_m` and `K'_n = R(n)·K_n`, where `R(m)` is the
+block-diagonal `R_m`. The score is:
+
+```text
+(Q'_m)ᵀ K'_n
+ = (R(m)·Q_m)ᵀ (R(n)·K_n)                   substitute
+ = Q_mᵀ R(m)ᵀ R(n) K_n                      (A·x)ᵀ = xᵀ·Aᵀ
+ = Q_mᵀ R(−m) R(n) K_n                      orthogonality: R(m)ᵀ = R(m)⁻¹ = R(−m)
+ = Q_mᵀ R(n − m) K_n                        composition: R(a)·R(b) = R(a + b)
+```
+
+**Every step explained:**
+
+1. **Substitute** the definitions of `Q'_m` and `K'_n`.
+2. **Transpose of a product.** `(A·x)ᵀ = xᵀAᵀ` (the order reverses).
+3. **Orthogonality.** For each 2 × 2 block, `R(φ)ᵀ = R(−φ)` (Entry 5:
+   transposing swaps the signs of `sin φ`, and `sin(−φ) = −sin φ`). A
+   block-diagonal matrix is transposed block by block. Thus
+   `R(m)ᵀ = diag(R(−m·θⱼ)) = R(−m)`.
+4. **Composition.** Block `j`: `R(−m·θⱼ)·R(n·θⱼ) = R((n − m)·θⱼ)`.
+   Block-diagonal matrices multiply block by block, so the pairs compose
+   **independently**: `R(−m)·R(n) = diag(R((n − m)·θⱼ)) = R(n − m)`.
+
+**Why the result contains only `n − m`.** The middle matrix `R(n − m)`
+depends only on the difference. `Q_m` and `K_n` carry the content. Thus the
+absolute positions vanish from the score. Shifting every position by the same
+amount changes nothing (test
+`tensor_scores_do_not_depend_on_the_start_position`).
+
+**Per pair:** the score is a sum over the pairs,
+`Σⱼ (q-pair j)ᵀ R((n − m)·θⱼ) (k-pair j)`. Fast pairs (large `θⱼ`) react to
+small distances; slow pairs react to large distances.
+
+### 3.5 Numerical demonstration in two dimensions
+
+Choose: `q = [1, 2]`, `k = [3, −1]`, frequency `θ = 0.5`, query position
+`m = 2`, key position `n = 5`.
+
+**1. Original query:** `q = [1, 2]`. **2. Original key:** `k = [3, −1]`.
+(Without rotation: `qᵀk = 1·3 + 2·(−1) = 1`.)
+
+**3. Rotated query:** angle `m·θ = 2·0.5 = 1`.
+
+```text
+cos 1 = 0.5403023,  sin 1 = 0.8414710
+q'₀ = 1·0.5403023 − 2·0.8414710 = 0.5403023 − 1.6829420 = −1.1426397
+q'₁ = 1·0.8414710 + 2·0.5403023 = 0.8414710 + 1.0806046 =  1.9220756
+```
+
+**4. Rotated key:** angle `n·θ = 5·0.5 = 2.5`.
+
+```text
+cos 2.5 = −0.8011436,  sin 2.5 = 0.5984721
+k'₀ = 3·(−0.8011436) − (−1)·0.5984721 = −2.4034308 + 0.5984721 = −1.8049587
+k'₁ = 3·0.5984721 + (−1)·(−0.8011436) =  1.7954164 + 0.8011436 =  2.5965600
+```
+
+**5. Rotated dot product:**
+
+```text
+q'ᵀk' = (−1.1426397)·(−1.8049587) + 1.9220756·2.5965600
+      = 2.0624174 + 4.9907847
+      = 7.0532021
+```
+
+**6. The equivalent relative rotation:** angle `(n − m)·θ = 3·0.5 = 1.5`.
+
+```text
+cos 1.5 = 0.0707372,  sin 1.5 = 0.9974950
+(R(1.5)k)₀ = 3·0.0707372 − (−1)·0.9974950 = 0.2122116 + 0.9974950 = 1.2097066
+(R(1.5)k)₁ = 3·0.9974950 + (−1)·0.0707372 = 2.9924850 − 0.0707372 = 2.9217478
+```
+
+**7. Final dot product:**
+
+```text
+qᵀ R(1.5) k = 1·1.2097066 + 2·2.9217478 = 1.2097066 + 5.8434955 = 7.0532021
+```
+
+Both calculations give `7.0532021` (in `f64`: `7.053202107896084` for both;
+the test `two_dimensional_relative_position_demonstration` checks this
+within `1e−12`). The positions 2 and 5 appear only through their difference
+3.
+
+## 4. Rust concepts learned
+
+### 4.1 Nested `chunks_exact_mut` that follow the layout
+
+```rust
+for batch_element in tensor.as_mut_slice().chunks_exact_mut(batch_len) {        // S·H·D
+    for (token, position) in batch_element.chunks_exact_mut(token_len)           // H·D
+                                          .zip(positions.iter()) {
+        for head in token.chunks_exact_mut(shape.features) {                     // D
+            self.rotate_pairs(head, position);
+        }
+    }
+}
+```
+
+Each level divides the previous slice into non-overlapping sub-slices. The
+three levels match the strides of the layout. Thus:
+
+- **Batch boundaries** are preserved: a `batch_element` slice cannot reach
+  into the next one.
+- **Sequence order** is preserved: `zip(positions.iter())` gives token `s`
+  the position `start + s`.
+- **Head boundaries** are preserved: `rotate_pairs` receives exactly `D`
+  values.
+
+There is no index arithmetic in the loop at all, and thus no off-by-one
+risk. The compiler checks that the slices do not overlap.
+
+### 4.2 Reuse of the Stage 4 loop
+
+The tensor code calls `rotate_pairs`, the same private loop as
+`rotate_in_place`. The rotation logic exists once.
+
+### 4.3 Two mutable borrows at the same time
+
+`rotate_query_key_in_place(&self, query: &mut Tensor4, key: &mut Tensor4, ...)`
+holds two `&mut` borrows. This is allowed because they are two different
+values. If a caller tries `rotate_query_key_in_place(&mut t, &mut t, ...)`,
+the compiler rejects it: two mutable borrows of the same value.
+
+### 4.4 Validate everything, then mutate
+
+`check_query_key` checks both tensors before the first write. This gives
+"all or nothing" behavior: an error leaves both tensors unchanged (test
+`invalid_head_dimensions`).
+
+### 4.5 Clone only where necessary
+
+`rotate_query_key(&q, &k, ...)` borrows the inputs, so it must clone them
+(two allocations). `rotate_query_key_in_place` needs no clone.
+
+## 5. Memory and execution
+
+**Execution of `rotate_query_key_in_place(&mut q, &mut k, start)`:**
+
+1. Check `(B, S)` equal, `D = d` for both, and `start + S − 1 ≤ 2^53`.
+2. For `q`, then `k`: one sequential pass over the data. For each head
+   vector: `D/2` angle multiplications, `D/2` `sin_cos` calls, `D/2` pair
+   rotations.
+3. No allocation.
+
+**Ownership:** `self` (the frequencies) is shared-borrowed. `q` and `k` are
+mutably borrowed during the call and are usable again after it.
+
+## 6. Engineering decisions
+
+1. **Methods on `RotaryEmbedding`** in `embeddings.rs`. Its planned
+   responsibility (Stage 1) was "query and key vectors, and batches".
+2. **Positions `start + s`**, the same for every batch element. This is the
+   usual convention when all sequences in the batch are aligned.
+   (Per-sequence position offsets, for example for padded batches, are not
+   needed now.)
+3. **`B` and `S` must match between `q` and `k`; `H` may differ.** Each
+   tensor is rotated independently, so different head counts (grouped-query
+   attention) need no extra code.
+4. **No value parameter** (section 3.3).
+5. **The `D ≠ d` error reuses `EmbeddingDimensionMismatch`**: a head vector is
+   an embedding of length `D`.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Index-based loops with the formula | Mirrors the mathematics | Off-by-one risk; bounds checks; the chunk version is clearer |
+| `chunks_exact_mut(D)` over the whole slice + a computed `s = (v / H) % S` | One loop | Division per vector; hides the structure |
+| Take `q`, `k` by value and return them | No clone, functional style | On an error, the tensors are dropped and lost |
+| A `cos`/`sin` table per position, reused for all `B·H` vectors | `S·D/2` instead of `B·S·H·D/2` trig calls | Memory and setup; planned for Stage 9 |
+
+## 8. Performance considerations
+
+- **Time:** `O(B·S·H·D)`. **Extra space:** 0 (in place) or `2·B·S·H·D·8`
+  bytes (copying version).
+- **Trigonometry:** `B·S·H·D/2` `sin_cos` calls per tensor. The values
+  depend only on `(s, j)`, so a table would need only `S·D/2` calls: a
+  reduction by the factor `B·H` (for example 32 for `B = 2, H = 16`). Not
+  implemented now (no premature optimization).
+- **Memory access:** one sequential pass; every cache line is used fully.
+
+**Benchmark** (`cargo bench`, release build, this computer, `std::time`,
+best of 15 runs after 3 warm-up runs; `D = 64`, `b = 10000`):
+
+| Shape `[B, S, H, D]` | `rotate_tensor_in_place` | per pair | `rotate_query_key` (q + k, 2 clones) |
+|---|---|---|---|
+| `[1, 128, 8, 64]` | 0.255 ms | 7.8 ns | 0.699 ms |
+| `[1, 512, 8, 64]` | 1.114 ms | 8.5 ns | 3.153 ms |
+| `[2, 512, 16, 64]` | 4.409 ms | 8.4 ns | 11.665 ms |
+
+The per-pair time is almost constant: the cost is linear in the size.
+`rotate_query_key` rotates **two** tensors and clones both: about 2 × the
+in-place time plus about 3 ns per pair for the copies. These numbers are a
+first measurement, not a rigorous benchmark.
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::tensor::{Tensor4, TensorShape};
+use rust_rope::rope::{config::RopeConfig, embeddings::RotaryEmbedding, position::Position};
+
+let rope = RotaryEmbedding::new(RopeConfig::new(4, 10_000.0)?);
+let shape = TensorShape::new(2, 4, 2, 4);
+let mut q = Tensor4::from_fn(shape, |b, s, h, d| (b + s + h + d) as f64)?;
+let mut k = q.clone();
+let v = q.clone();
+rope.rotate_query_key_in_place(&mut q, &mut k, Position::ZERO)?;
+assert_eq!(q.vector(0, 0, 0), v.vector(0, 0, 0)); // s = 0: position 0
+assert_ne!(q.vector(0, 1, 0), v.vector(0, 1, 0)); // s = 1: rotated
+// `v` was never passed to RoPE: unchanged.
+```
+
+## 10. Test results and what we learned
+
+**Test results:** all tests pass (`cargo test`, 2026-11-01). New Stage 5
+tests: 6 unit tests in `tensor.rs`; 11 API tests in `rope_tests.rs`
+(batch 1 and 2, sequence 1 and more, several heads, `D = 2, 4, 8`, start
+positions, invalid shapes, invalid head dimensions, value preservation,
+batch and head isolation, sequence order); 5 numerical tests in
+`numerical_tests.rs` (A: position 0, B: pair lengths, C: relative-position
+property for all `(b, h, m, n)`, score independence of `start`, the 2-D
+demonstration).
+
+**Mathematics:** RoPE rotates `Q` and `K` at their positions, never `V`;
+all heads share `θⱼ`; `(R(m)q)ᵀ(R(n)k) = qᵀR(n − m)k` follows from
+`(Ax)ᵀ = xᵀAᵀ`, `R(m)ᵀ = R(−m)` and `R(a)R(b) = R(a + b)`, block by block.
+
+**Rust:** nested `chunks_exact_mut` mirror a tensor layout without index
+arithmetic; two simultaneous `&mut` borrows of different values are
+allowed; validate first, then mutate; clone only when the caller keeps the
+original.
+
+
+---
+
+# Entry 13 — Independent PyTorch reference validation and floating-point precision (Stage 6)
+
+**Date:** 2026-11-01
+**Stage:** 6 (reference validation)
+**Files:** `examples/export_reference_cases.rs` (new), `reference/pytorch_rope.py`,
+`reference/compare_rope.py`, `reference/test_pytorch_rope.py`,
+`reference/README.md`, `reference/requirements.txt` (all new; Python
+validation tooling), `.gitignore`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| Rust export of deterministic cases (51 vectors, 15 tensors) | ✅ Implemented |
+| Independent PyTorch reference (frequencies, angles, `cos`/`sin`, interleaved, split-half, partial) | ✅ Implemented |
+| Comparison in float64 (strict) and float32 (precision study) | ✅ Implemented — **all 66 cases pass** |
+| Reference self-tests and negative controls | ✅ 12 tests pass |
+| Split-half and partial RoPE **in Rust** | ⏳ Stage 7 (Entry 14). In Stage 6, the comparison covers only the interleaved, full-rotation Rust code. |
+
+**The Python code is validation tooling, not the production RoPE
+implementation.** The library in `src/` does not depend on it. PyTorch
+2.15.0 (CPU) and NumPy 2.5.4 run in a project-local virtual environment
+`reference/.venv` (git-ignored).
+
+---
+
+## 1. What did we build?
+
+A validation pipeline with three parts:
+
+```text
+cargo run --example export_reference_cases
+        │  deterministic inputs + Rust outputs (text, exact f64)
+        ▼
+reference/data/rust_cases.txt
+        │
+        ▼
+reference/compare_rope.py ──► pytorch_rope.apply_rope (float64 and float32)
+        │
+        ▼
+max abs error, mean abs error, max relative error, tolerance → PASS / FAIL
+```
+
+## 2. Why did we build it?
+
+Our tests so far check **properties** (length preservation, composition,
+the relative-position identity) and values that **we** calculated. A
+property test cannot detect a wrong convention that keeps the property. For
+example, a wrong frequency formula still keeps every length. An
+**independent reference** detects such errors: two implementations that
+were written separately are unlikely to contain the same mistake.
+
+## 3. Mathematical foundation
+
+### 3.1 Why two independent implementations should agree
+
+Both implementations calculate the same mathematical function:
+
+```text
+f(x, m)ₖ = x₂ⱼ cos(m·θⱼ) − x₂ⱼ₊₁ sin(m·θⱼ)    (k = 2j)
+f(x, m)ₖ = x₂ⱼ sin(m·θⱼ) + x₂ⱼ₊₁ cos(m·θⱼ)    (k = 2j + 1),   θⱼ = b^(−2j/d)
+```
+
+In exact arithmetic, the results are identical. In floating-point
+arithmetic, each operation rounds. The two implementations use different
+operations (section 3.6), so their roundings differ. Thus we expect:
+
+```text
+Rust_RoPE(x, m) ≈ PyTorch_RoPE(x, m)      (equal within a tolerance, not bit for bit)
+```
+
+### 3.2 Error measures
+
+Let `r` be the Rust output and `p` the PyTorch output, both with `N` values.
+
+```text
+max_error  = maxₖ |rₖ − pₖ|                    (the worst single value)
+mean_error = (1/N) Σₖ |rₖ − pₖ|                (the typical value)
+max_rel    = maxₖ |rₖ − pₖ| / |pₖ|             (only where |pₖ| ≥ 10⁻³ · max|p|)
+```
+
+**Absolute error** measures the difference in the units of the data.
+**Relative error** measures the difference as a fraction of the value.
+Example: an error of `0.001` is large for the value `0.002` (50 %), but small
+for the value `1000` (0.0001 %).
+
+**Why relative error can mislead near zero.** If `pₖ = 10⁻¹⁵` (a
+mathematical zero with a rounding residue) and `rₖ = 2·10⁻¹⁵`, the relative
+error is 100 %, although both values are correct within rounding. Thus we
+calculate the relative error only for values that are not close to zero
+compared with the largest value.
+
+### 3.3 IEEE 754 floating-point numbers
+
+IEEE 754 is the standard for binary floating-point numbers. A number is:
+
+```text
+value = (−1)^sign × 1.fraction × 2^(exponent − bias)
+```
+
+| Type | Bits | Sign | Exponent | Fraction | Significant bits | Machine epsilon `ε` |
+|---|---|---|---|---|---|---|
+| `f32` / `float32` | 32 | 1 | 8 | 23 | 24 | `2^−23 ≈ 1.19 × 10⁻⁷` |
+| `f64` / `float64` | 64 | 1 | 11 | 52 | 53 | `2^−52 ≈ 2.22 × 10⁻¹⁶` |
+
+**Machine epsilon `ε`** is the distance from 1.0 to the next larger
+representable number. Every basic operation (`+ − × ÷ √`) gives the exact
+result **rounded to the nearest representable number**. The relative error
+of one rounding is at most `ε/2`. This is a "unit in the last place" (ulp)
+level error.
+
+### 3.4 How errors accumulate in RoPE
+
+| Step | Operation | Error |
+|---|---|---|
+| `θⱼ` | `powf` (or `**` and `1/…`) | 1 to 2 roundings: relative `≈ ε` |
+| `φ = m·θⱼ` | 1 multiplication | relative `≈ 2ε` → **absolute** `≈ 2ε·φ` |
+| `cos φ`, `sin φ` | library functions | about 1 ulp each, **plus** the input error of `φ` |
+| `x cos φ − y sin φ` | 2 multiplications, 1 subtraction | `≈ 3ε·|x|` |
+
+The important row is `φ`. Its **absolute** error grows with the angle,
+and the angle grows with the position. `cos` and `sin` change by about the
+same absolute amount as their input. Thus the output error is about:
+
+```text
+|error| ≈ c · ε · (1 + φ_max) · max|x|          (c = a small constant)
+```
+
+This is our **tolerance model** with `c = 8`:
+
+```text
+tol = 8 · ε · (1 + max_angle) · max(1, max|x|)
+```
+
+- `ε` is the epsilon of the **reference** dtype.
+- `max_angle = (start + S − 1) · θ₀` with `θ₀ = 1`.
+- `8` covers the roughly 4 to 6 roundings of the table above.
+
+The tolerance follows from the error analysis. It was not tuned to make
+the tests pass.
+
+### 3.5 float32 versus float64
+
+In float32 mode, PyTorch calculates everything in float32. The Rust result
+is float64. Thus the float32 error measures **the error of float32 RoPE**.
+`ε₃₂/ε₆₄ = 2^29 ≈ 5.4 × 10⁸`. At large positions, the float32 angle error
+becomes visible: at `m = 100 000`, `d = 128`, we measured a maximum error of
+`1.15 × 10⁻²` (section 3.7). This is the reason why long-context
+implementations calculate the angles carefully.
+
+### 3.6 Why mathematically equal code gives slightly different numbers
+
+1. **Different formula forms.** Rust: `θⱼ = b.powf(−2j/d)` (one rounding).
+   PyTorch reference: `θⱼ = 1 / b^(2j/d)` (two roundings). The two results
+   can differ by 1 ulp.
+2. **Different library functions.** Rust calls the C runtime `sin`/`cos`.
+   PyTorch can use its own vectorized implementations. Both are accurate to
+   about 1 ulp, but not always identical.
+3. **Different operation order.** For example `a·c − b·s` versus
+   `a·c + (−b)·s` are identical, but `x·cos + rotate_half(x)·sin` with a
+   different order of the products would round differently.
+
+### 3.7 Validation results (2026-11-01)
+
+**All 66 cases pass in both modes** (`compare_rope.py`, exit code 0).
+
+| Mode | Worst max abs error | Largest mean abs error | Worst max rel error |
+|---|---|---|---|
+| float64 | `1.94 × 10⁻¹¹` | `6.84 × 10⁻¹³` | `3.62 × 10⁻¹¹` |
+| float32 | `1.15 × 10⁻²` | `4.34 × 10⁻⁴` | `6.22 × 10⁻²` |
+
+Representative cases (max abs error / tolerance):
+
+| Case | float64 | float32 |
+|---|---|---|
+| `d = 2`, `m = 1` | `0` / `7.3e−15` | `6.5e−8` / `3.9e−6` |
+| `d = 8`, `m = 100 000` | `0` / `3.8e−10` | `1.6e−5` / `2.0e−1` |
+| `d = 128`, `m = 1000` | `1.2e−13` / `3.9e−12` | `7.3e−5` / `2.1e−3` |
+| `d = 128`, `m = 100 000` | `1.9e−11` / `4.0e−10` | `1.2e−2` / `2.1e−1` |
+| tensor `[3, 7, 2, 128]`, `b = 500 000`, start 4096 | `3.2e−13` / `1.6e−11` | `7.8e−4` / `8.8e−3` |
+| tensor `[2, 4, 2, 4]`, start 0 | `0` / `1.6e−14` | `1.7e−7` / `8.3e−6` |
+
+**Analysis of the float64 differences.** For `d = 2` and `d = 8`, the
+float64 error is exactly 0, even at `m = 100 000`. For `d = 64` and
+`d = 128`, it grows with `m`. We investigated before we drew a conclusion:
+
+| `d` | `θⱼ` values that differ between `b^(−x)` and `1/b^x` | max relative difference | angle difference at `m = 10⁵` |
+|---|---|---|---|
+| 8 | 0 of 4 | 0 | 0 |
+| 64 | 11 of 32 | `1.8 × 10⁻¹⁶` | `5.6 × 10⁻¹²` |
+| 128 | 24 of 64 | `2.0 × 10⁻¹⁶` | `5.6 × 10⁻¹²` |
+
+**Root cause:** the two frequency conventions (section 3.6, item 1) differ
+by 1 ulp for some `θⱼ`. The position multiplies this difference. The output
+difference `1.9 × 10⁻¹¹` equals about this angle difference times
+`max|x| ≈ 2.25`, plus rounding. **There is no bug.** Both implementations
+are correct within the error model.
+
+### 3.8 The failure-analysis checklist
+
+The task required a checklist for mismatches. We apply it to every new
+comparison:
+
+1. Same dimension layout? (case field `layout`)
+2. Same frequency formula? (both `b^(−2j/r)`, different rounding form)
+3. Same position indices? (`start + s` in both)
+4. Same tensor interpretation? (`[B, S, H, D]`, row-major in both)
+5. Same rotary dimension? (case field `rotary_dim`)
+6. Same dtype? (Rust f64; reference f64 or f32 by mode)
+7. Same base? (case field `base`, exact text)
+8. A precision difference? (compare with the error model)
+
+**Negative controls** prove that the comparison can fail: with a wrong
+layout, a wrong base or a wrong start position, the error becomes larger
+than `10⁻³` (tests in `test_pytorch_rope.py`).
+
+## 4. Rust concepts learned
+
+### 4.1 Exact text exchange with `{:?}`
+
+`format!("{v:?}")` for an `f64` prints the **shortest** decimal string that
+parses back to exactly the same bits (for example `0.1`, not
+`0.1000000000000000055511151231257827`). Python's `float()` uses the same
+round-trip rule. Thus the text file does not add any rounding error, and we
+need no external serialization crate.
+
+### 4.2 `std::fmt::Write` for building a `String`
+
+```rust
+use std::fmt::Write as _;
+let _ = write!(out, " {v:?}");
+```
+
+`write!` normally writes to a stream. With the trait `std::fmt::Write` in
+scope, it also writes into a `String`. `as _` imports the trait only for its
+methods, without a name. Writing into a `String` cannot fail, so we ignore
+the `Result` with `let _ =`.
+
+### 4.3 `Box<dyn std::error::Error>` in a program
+
+`main() -> Result<(), Box<dyn std::error::Error>>` lets `?` propagate
+`RopeError`, `TensorError` and `std::io::Error` with one return type.
+`dyn Error` is a **trait object**: a pointer to some value whose type
+implements `Error`; the concrete type is decided at run time.
+
+### 4.4 Python in brief (for readers who do not know PyTorch)
+
+- `torch.tensor(list, dtype=torch.float64)`: an N-D array (like
+  `Tensor4`).
+- `x.reshape(B, S, H, D)`: reinterpret the same values with another shape.
+- `x[..., :r]`: all leading axes, the first `r` features (like a Rust
+  slice `&v[..r]` on each head vector).
+- **Broadcasting:** `cos` with the shape `[1, S, 1, r/2]` multiplies a
+  tensor `[B, S, H, r/2]`; PyTorch repeats `cos` along the axes of size 1.
+  This is how one angle table serves every batch element and head.
+- `torch.outer(p, θ)`: the table `p[s]·θ[j]` (Entry 9).
+
+## 5. Memory and execution
+
+The export program holds one case at a time in memory and appends text to
+one `String` (about 200 KB for 66 cases). The comparison runs in less than
+one second.
+
+## 6. Engineering decisions
+
+1. **The reference reads Rust's inputs**, so the inputs are identical by
+   construction. The input generator exists only in Rust.
+2. **A different frequency form in the reference** (`1/b^x`) to make the
+   implementations more independent. Section 3.7 shows its measurable
+   effect.
+3. **Vectorized PyTorch code** (broadcasting, `stack`, `cat`) instead of a
+   loop over pairs: a different algorithm structure from the Rust loop.
+4. **A text format, not JSON or binary.** No dependency, human-readable,
+   exact.
+5. **A virtual environment** for PyTorch, so the global Python stays
+   unchanged.
+6. **The tolerance comes from an error model**, scaled with dtype, angle
+   and magnitude. A fixed `1e−12` would be too strict for `m = 10⁵` and too
+   loose for `m = 0`.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Call Rust from Python (PyO3) | One process | Adds a heavy dependency; the reference would no longer be independent of the build |
+| JSON with `serde` | Standard format | An external Rust dependency for one file |
+| Hugging Face `transformers` RoPE | A widely used implementation | A large dependency; its functions change between versions; split-half only |
+| Bitwise comparison | Simple | Fails for correct code (section 3.6) |
+| A fixed tolerance | Simple | Ignores the growth of the error with the position |
+
+## 8. Performance considerations
+
+The validation is not performance-critical. The export and the comparison
+each take less than one second for 66 cases.
+
+## 9. Practical example
+
+```text
+$ cargo run --example export_reference_cases
+wrote 66 cases to reference/data/rust_cases.txt
+$ reference/.venv/Scripts/python reference/compare_rope.py
+...
+worst over all cases, float64: max abs 1.936e-11, largest mean abs 6.836e-13, max rel 3.619e-11
+worst over all cases, float32: max abs 1.146e-02, largest mean abs 4.338e-04, max rel 6.217e-02
+
+all 66 cases pass in float64 and float32
+$ reference/.venv/Scripts/python -m unittest discover -s reference
+Ran 12 tests ... OK
+```
+
+## 10. What we learned
+
+**Mathematics and numerics:** an independent reference catches convention
+errors that property tests cannot catch; absolute versus relative error;
+IEEE 754 formats and `ε`; the absolute angle error grows with the position;
+a tolerance derived from an error model; a 1-ulp difference in `θ` becomes a
+`10⁻¹¹` output difference at `m = 10⁵`; float32 RoPE has errors near
+`10⁻²` at `m = 10⁵`.
+
+**Rust:** `{:?}` gives exact round-trip text for `f64`; `fmt::Write` into
+a `String`; `Box<dyn Error>` for programs with several error types.
+
+
+---
+
+# Entry 14 — Interleaved and split-half layouts (Stage 7, part 1)
+
+**Date:** 2026-11-01
+**Stage:** 7 (layouts and partial RoPE)
+**Files:** `src/rope/config.rs` (`RopeLayout`, `with_layout`),
+`src/rope/embeddings.rs` (`rotate_pairs` with `match`),
+`tests/rope_tests.rs`, `tests/numerical_tests.rs`,
+`examples/export_reference_cases.rs`, `benches/rope_benchmark.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `enum RopeLayout { Interleaved, SplitHalf }` (default `Interleaved`) | ✅ Implemented |
+| `RopeConfig::with_layout` | ✅ Implemented |
+| Split-half rotation for vectors and `[B, S, H, D]` tensors | ✅ Implemented |
+| PyTorch comparison of both layouts | ✅ All cases pass (Entry 15, section 3.6) |
+| Automatic conversion of weights between layouts | ❌ Not implemented (a test shows the permutation) |
+
+---
+
+## 1. What did we build?
+
+A configuration choice between the two common pair layouts, and the
+split-half rotation. The interleaved code of Stage 4 did not change.
+
+## 2. Why did we build it?
+
+Different model families store the pairs differently. To compare with (or
+load weights from) a model, we must use its layout. Entry 10, section 3.8,
+explained the layouts; now we implement both.
+
+## 3. Mathematical foundation
+
+### 3.1 The interleaved layout (unchanged)
+
+For `x = [x0, x1, x2, x3, x4, x5]` (`d = 6`), the pairs are `(x0, x1)`,
+`(x2, x3)`, `(x4, x5)`. Pair `j` = `(x₂ⱼ, x₂ⱼ₊₁)`, angle `φⱼ = m·θⱼ`.
+The existing code uses `chunks_exact_mut(2)` for this.
+
+### 3.2 The split-half layout
+
+Divide the rotary part into two halves of `d/2` values:
+
+```text
+x = [ x0  x1  x2 | x3  x4  x5 ]
+      first half   second half
+pairs: (x0, x3), (x1, x4), (x2, x5)      → pair j = (xⱼ, x_(j + d/2))
+```
+
+For pair `j`, the rotation is the same 2-D rotation as always, applied to
+the two components `xⱼ` and `x_(j + d/2)`:
+
+```text
+x'ⱼ         = xⱼ · cos φⱼ − x_(j + d/2) · sin φⱼ
+x'_(j + d/2) = xⱼ · sin φⱼ + x_(j + d/2) · cos φⱼ
+```
+
+**Step by step:**
+
+1. Select the "first" coordinate `xⱼ` from the first half and the
+   "second" coordinate `x_(j + d/2)` from the second half.
+2. Treat `(xⱼ, x_(j + d/2))` as a point in a plane.
+3. Apply `R(φⱼ)`: the first coordinate gets `cos·first − sin·second`, the
+   second coordinate gets `sin·first + cos·second`.
+
+**Why it is still a collection of 2-D rotations.** Every component belongs
+to exactly one pair, and no pair shares a component with another pair. Thus
+the full transformation is a block-diagonal rotation, only in a different
+**ordering** of the coordinates. Formally, with a permutation matrix `P`
+that moves `xⱼ` to slot `2j` and `x_(j + d/2)` to slot `2j + 1`:
+
+```text
+RoPE_split(x) = Pᵀ · RoPE_interleaved(P·x)
+```
+
+`P` is orthogonal (`PᵀP = I`), so all properties (length preservation, the
+relative-position identity) are the same. The test
+`layouts_are_equivalent_after_a_permutation` checks this bit for bit with
+`P = [0, 4, 1, 5, 2, 6, 3, 7]` for `d = 8`.
+
+### 3.3 The "rotate_half" form
+
+Many PyTorch implementations write the split-half rotation without pairs:
+
+```text
+x' = x ⊙ [cos φ, cos φ] + rotate_half(x) ⊙ [sin φ, sin φ]
+rotate_half([first, second]) = [−second, first]
+```
+
+Check component `j < d/2`: `xⱼ cos φⱼ + (−x_(j+d/2)) sin φⱼ` — the first
+equation. Component `j + d/2`: `x_(j+d/2) cos φⱼ + xⱼ sin φⱼ` — the second
+equation. Our PyTorch reference uses this form; the Rust code uses explicit
+pairs. Two different algorithms, the same mathematics.
+
+### 3.4 The data layouts differ, the mathematics does not
+
+| | Interleaved | Split-half |
+|---|---|---|
+| Pair `j` | `(x₂ⱼ, x₂ⱼ₊₁)` | `(xⱼ, x_(j+d/2))` |
+| Distance between partners | 1 | `d/2` |
+| Frequency of pair `j` | `θⱼ = b^(−2j/d)` | `θⱼ = b^(−2j/d)` (the same) |
+| Frequency along the vector | `θ₀ θ₀ θ₁ θ₁ θ₂ θ₂ …` | `θ₀ θ₁ θ₂ … θ₀ θ₁ θ₂ …` |
+| Used by | RoFormer, original LLaMA code (complex view) | Hugging Face Llama/GPT-NeoX "rotate_half" |
+
+**Why the conventions must match.** The weights `W_Q`, `W_K` of a trained
+model produce features in a fixed order. If the model was trained with
+split-half, its feature `j` and feature `j + d/2` were trained as partners.
+Interleaved RoPE would rotate feature `j` with feature `j + 1` instead: a
+different function. The scores would be wrong, although every RoPE property
+still holds. (The Hugging Face conversion scripts for LLaMA permute the
+rows of `W_Q` and `W_K` for exactly this reason.)
+
+### 3.5 Numerical example: split-half, `d = 6`, `m = 1`, `b = 10000`
+
+`x = [1, 2, 3, 4, 5, 6]`. Frequencies: `θⱼ = 10000^(−2j/6)`:
+
+```text
+θ₀ = 10000^0      = 1
+θ₁ = 10000^(−1/3) = 1 / 21.5443469 = 0.0464159
+θ₂ = 10000^(−2/3) = 1 / 464.158883 = 0.0021544
+```
+
+Pairs `(x0, x3) = (1, 4)`, `(x1, x4) = (2, 5)`, `(x2, x5) = (3, 6)`.
+
+```text
+pair 0: φ = 1          cos = 0.5403023  sin = 0.8414710
+        x'0 = 1·0.5403023 − 4·0.8414710 = 0.5403023 − 3.3658839 = −2.8255816
+        x'3 = 1·0.8414710 + 4·0.5403023 = 0.8414710 + 2.1612092 =  3.0026802
+pair 1: φ = 0.0464159  cos = 0.9989230  sin = 0.0463992
+        x'1 = 2·0.9989230 − 5·0.0463992 = 1.9978460 − 0.2319961 =  1.7658498
+        x'4 = 2·0.0463992 + 5·0.9989230 = 0.0927984 + 4.9946149 =  5.0874133
+pair 2: φ = 0.0021544  cos = 0.9999977  sin = 0.0021544
+        x'2 = 3·0.9999977 − 6·0.0021544 = 2.9999930 − 0.0129266 =  2.9870664
+        x'5 = 3·0.0021544 + 6·0.9999977 = 0.0064633 + 5.9999861 =  6.0064494
+```
+
+```text
+x' = [−2.8255816, 1.7658498, 2.9870664, 3.0026802, 5.0874133, 6.0064494]
+```
+
+Check pair 0: `2.8255816² + 3.0026802² = 7.9839 + 9.0161 = 17.0000 = 1² + 4²`.
+
+(The test `split_half_numerical_example` checks these values with 9
+decimals. Correction note: the first version of that test contained
+expected constants that we had not calculated; the test failed, and we
+replaced them with values from an independent Python `math` calculation.
+The test caught our own mistake.)
+
+## 4. Rust concepts learned
+
+### 4.1 Enums and how Rust represents them
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeLayout {
+    #[default]
+    Interleaved,
+    SplitHalf,
+}
+```
+
+An `enum` type has a fixed set of variants. A value is exactly one variant.
+These variants carry no data, so the compiler stores a `RopeLayout` as a
+small integer **discriminant** (1 byte): 0 for `Interleaved`, 1 for
+`SplitHalf`. `#[default]` selects the value of `RopeLayout::default()`.
+
+**Why not a string?** `layout: &str = "split_half"` accepts
+`"split-half"`, `"SplitHalf"` and `"spilt_half"`; every typing mistake
+becomes a run-time error (or a silent wrong branch). With an enum, a wrong
+name does not compile, and the compiler checks that every `match` handles
+every variant.
+
+### 4.2 Pattern matching
+
+```rust
+match self.config.layout() {
+    RopeLayout::Interleaved => { /* chunks_exact_mut(2) */ }
+    RopeLayout::SplitHalf => { /* split_at_mut(d / 2) */ }
+}
+```
+
+`match` compares the value with each pattern from top to bottom and runs
+the first arm that matches. The match must be **exhaustive**. The compiler
+translates this simple match into one comparison (or a jump table). The
+layout is the same for every vector, so the processor's branch predictor
+predicts it correctly nearly every time.
+
+### 4.3 `split_at_mut`: two mutable halves
+
+```rust
+let (first, second) = rotary.split_at_mut(rotary_dimension / 2);
+for ((a, b), &theta) in first.iter_mut().zip(second.iter_mut()).zip(&self.inverse_frequencies) {
+    let [ra, rb] = rotate_pair([*a, *b], phi);
+    *a = ra;
+    *b = rb;
+}
+```
+
+The borrow rules forbid two `&mut` borrows of the same slice. But
+`split_at_mut(k)` returns **two** mutable slices, `[0, k)` and `[k, len)`.
+The standard library guarantees that they do not overlap, so the compiler
+accepts both at the same time. Then `iter_mut()` gives `&mut f64` items;
+`*a` reads the value and `*a = ra` writes through the reference.
+
+The equivalent code `rotary[j]` and `rotary[j + d/2]` with indices would
+also work, but it has two bounds checks per pair and hides the structure.
+
+### 4.4 Struct update syntax and builder methods
+
+```rust
+pub fn with_layout(self, layout: RopeLayout) -> Self {
+    RopeConfig { layout, ..self }
+}
+```
+
+`..self` copies all other fields from `self`. The method takes `self` **by
+value** and returns a new value. `RopeConfig` is `Copy`, so the caller's
+value stays usable. Calls chain: `RopeConfig::new(64, b)?.with_layout(..)`.
+
+## 5. Memory and execution
+
+- Interleaved: each pair is 16 contiguous bytes; the loop reads and writes
+  sequentially.
+- Split-half: each pair is two values `8·d/2` bytes apart; the loop walks
+  two sequential streams (the first half and the second half) at the same
+  time. Both streams are sequential, so both are cache-friendly.
+- Both: `d/2` `sin_cos` calls, `d/2` angle multiplications, `2d`
+  multiplications and `d` additions per vector; `d` reads and `d` writes.
+
+## 6. Engineering decisions
+
+1. **The layout is part of `RopeConfig`**, not a parameter of each call: a
+   model uses one layout everywhere.
+2. **The default stays `Interleaved`**, so no earlier behaviour changed
+   (all earlier tests pass unchanged).
+3. **One loop function (`rotate_pairs`) with a `match`.** The vector and
+   tensor APIs, and every later feature, get both layouts automatically.
+4. **No layout conversion function.** The test shows the permutation; a
+   public function is not needed now.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| A trait `Layout` with two types and generics | No `match` at run time | More types and generic parameters; the branch is predictable anyway |
+| Permute to interleaved, rotate, permute back | One rotation loop | Two extra copies per vector |
+| The `rotate_half` formula in Rust | Matches PyTorch code | Needs a temporary vector or careful aliasing |
+| A string or `bool` parameter | Short | Typing mistakes; `true`/`false` do not say what they mean |
+
+## 8. Performance considerations
+
+Measured (`cargo bench`, release, `[2, 512, 16, 128]`, full rotation, best
+of 15): interleaved **8.56 ms**, split-half **9.01 ms** (8.2 vs 8.6 ns per
+pair). The difference (about 5 %) is close to the run-to-run variation of
+this simple benchmark (median 9.0 vs 9.6 ms). We do not conclude that one
+layout is faster. Stage 9 will measure this with a better methodology.
+
+## 9. Practical example
+
+```rust
+use rust_rope::rope::config::{RopeConfig, RopeLayout};
+use rust_rope::rope::embeddings::RotaryEmbedding;
+use rust_rope::rope::position::Position;
+
+let rope = RotaryEmbedding::new(RopeConfig::new(6, 10_000.0)?.with_layout(RopeLayout::SplitHalf));
+let y = rope.rotate(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Position::new(1)?)?;
+// y ≈ [−2.8255816, 1.7658498, 2.9870664, 3.0026802, 5.0874133, 6.0064494]
+```
+
+## 10. What we learned
+
+**Mathematics:** both layouts are block rotations of disjoint pairs; they
+differ by a fixed permutation `P`; `RoPE_split = Pᵀ·RoPE_inter·P`; the
+convention must match the trained weights; the `rotate_half` formula is the
+split-half rotation without explicit pairs.
+
+**Rust:** enums with a discriminant; exhaustive `match`; `split_at_mut`
+for two non-overlapping mutable slices; `iter_mut` and writes through
+`&mut`; struct update syntax `..self`; builder methods on a `Copy` type.
+
+---
+
+# Entry 15 — Partial RoPE, tensor integration and Stage 7 validation (Stage 7, part 2)
+
+**Date:** 2026-11-01
+**Stage:** 7
+**Files:** `src/rope/config.rs` (`with_head_dimension`, `head_dimension`,
+`rotary_dimension`), `src/utils/validation.rs`
+(`RotaryDimensionTooLarge`, `validate_head_dimension`),
+`src/rope/embeddings.rs`, tests, export, benchmark
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| Partial RoPE: head dimension `D` ≥ rotary dimension `d` | ✅ Implemented |
+| Both layouts with partial RoPE | ✅ Implemented |
+| Vectors and `[B, S, H, D]` tensors | ✅ Implemented |
+| PyTorch comparison of 160 cases (all layouts and partial) | ✅ All pass |
+| Rotation of a part other than the first `d` components | ❌ Not supported (not needed) |
+
+---
+
+## 1. What did we build?
+
+Partial RoPE. A configuration has a rotary dimension `d` and a head
+dimension `D ≥ d`. RoPE rotates components `0..d` with the selected layout
+and copies components `d..D` unchanged:
+
+```text
+x' = [ RoPE(x[0..d]),  x[d..D] ]
+```
+
+## 2. Why did we build it?
+
+Some models (for example GPT-NeoX, GPT-J and Phi models) rotate only a
+fraction of each head (a "rotary percentage", for example 25 % or 50 %).
+The unrotated components carry **position-independent** content: their
+dot-product contribution `qᵀk` is the same at every distance.
+
+## 3. Mathematical foundation
+
+### 3.1 The equation
+
+For a head vector `x ∈ R^D` and rotary dimension `d`:
+
+```text
+x'ₖ = (RoPE_layout(x[0..d], m))ₖ     for 0 ≤ k < d
+x'ₖ = xₖ                             for d ≤ k < D
+θⱼ  = b^(−2j/d),  j = 0 … d/2 − 1    (d, not D, in the exponent)
+```
+
+As a matrix: `R_m^partial = diag(R_m^(d), I_(D−d))`, a block-diagonal
+matrix whose last block is the identity.
+
+### 3.2 Why the rules
+
+- **`d` positive and even.** RoPE rotates pairs. `d = 0` rotates nothing
+  (that is not RoPE); an odd `d` leaves one rotary component without a
+  partner.
+- **`d ≤ D`.** RoPE can only rotate components that exist.
+- **`D` may be odd** when `d < D`: the pass-through part needs no pairs.
+
+### 3.3 Frequencies use the rotary dimension
+
+With `D = 128`, `d = 64`: `θ₁ = 10000^(−2/64) = 0.7499`, not
+`10000^(−2/128) = 0.8660`. The 32 rotary pairs still cover the full speed
+range `(1/b, 1]`. This is the convention of the common implementations (the
+frequency formula uses the rotary dimension). The test `partial_rope_128_with_64`
+checks `θ₁`.
+
+### 3.4 The score with partial RoPE
+
+```text
+q'ᵀk' = (q_rotᵀ R((n − m)) k_rot) + (q_passᵀ k_pass)
+         └ depends on n − m ┘        └ does not depend on position ┘
+```
+
+The relative-position property still holds (the second term depends on no
+position at all). Test: `stage_4_invariants_hold_for_every_layout_and_partial_rope`.
+
+### 3.5 Example: `D = 128`, `d = 64`
+
+```text
+x = [x0 … x63 | x64 … x127]
+     rotary     pass-through (bit-for-bit unchanged)
+interleaved: pairs (x0,x1) … (x62,x63)       split-half: pairs (x0,x32) … (x31,x63)
+```
+
+### 3.6 Stage 7 PyTorch validation results
+
+`cargo run --example export_reference_cases` now writes **160 cases** (66
+from Stage 6, 94 new). `compare_rope.py`: **all 160 pass** in float64 and
+float32 (exit code 0).
+
+| Group | Cases (per mode) | float64 max abs | float32 max abs |
+|---|---|---|---|
+| Split-half, full | 36 | `1.6 × 10⁻¹³` | `5.7 × 10⁻⁵` |
+| Split-half, partial | 25 | `7.6 × 10⁻¹⁴` | `6.0 × 10⁻⁴` |
+| Interleaved, partial | 25 | `1.6 × 10⁻¹³` | `6.9 × 10⁻⁴` |
+| All 160 cases | 160 | `1.9 × 10⁻¹¹` (Stage 6 case `d = 128`, `m = 10⁵`) | `1.1 × 10⁻²` |
+
+The PyTorch reference implements split-half with `rotate_half` (a different
+algorithm), and partial RoPE with `torch.cat`. Each case states its layout
+and rotary dimension, so the comparison never mixes layouts. The negative
+control "wrong layout" (Entry 13) shows that a mix would fail.
+
+## 4. Rust concepts learned
+
+### 4.1 Range indexing and `split_at_mut` for the pass-through part
+
+```rust
+let (rotary, _pass_through) = embedding.split_at_mut(rotary_dimension);
+```
+
+`split_at_mut(d)` is the mutable form of `(&v[..d], &v[d..])`. We use only
+`rotary`. The name `_pass_through` (with a leading `_`) documents the
+second part and tells the compiler that we do not use it on purpose. The
+code **never touches** `x[d..D]`, so these values stay bit-for-bit unchanged
+without a copy.
+
+### 4.2 `dimension()` now means two things — how we kept compatibility
+
+Before Stage 7, `RopeConfig::dimension()` was both the input length and
+the `d` of the frequency formula. Now they can differ:
+
+- `RopeConfig::dimension()` and `rotary_dimension()`: `d` (frequencies).
+- `RopeConfig::head_dimension()` and `RotaryEmbedding::dimension()`: `D`
+  (input length).
+
+`RopeConfig::new(d, b)` sets `D = d`. Thus every earlier call gives the same
+result, and all earlier tests pass unchanged.
+
+## 5. Memory and execution
+
+Per head vector, partial RoPE does `d/2` instead of `D/2` `sin_cos` calls,
+and reads and writes `d` instead of `D` values. The pass-through values are
+not read. But the cache lines that contain them may still be loaded,
+because the hardware prefetcher fetches sequential memory, and the next
+head's rotary part follows directly after.
+
+## 6. Engineering decisions
+
+1. **`with_head_dimension(D)` on the config**, not a separate "rotary
+   percentage". An integer is exact; a percentage can produce an odd or
+   rounded `d`.
+2. **The rotary part is the first `d` components**, as in the common
+   implementations.
+3. **Validation in `utils::validation`** with a new error variant that
+   contains both values.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `rotary_fraction: f64` | Matches some configuration files | Rounding; odd results possible |
+| Caller passes a sub-slice `&mut v[..d]` | No new configuration | Tensors cannot do this per head; error-prone |
+| Copy `x[d..]` into the output explicitly | Explicit | Useless work in the in-place path |
+
+## 8. Performance considerations
+
+Measured (`[2, 512, 16, 128]`, in place, best of 15, release):
+
+| Layout | `d = 128` (full) | `d = 64` (partial) | ratio |
+|---|---|---|---|
+| Interleaved | 8.56 ms | 7.26 ms | 0.85 |
+| Split-half | 9.01 ms | 8.21 ms | 0.91 |
+
+Partial RoPE does half of the trigonometry and half of the writes, but it
+was only 9 % to 15 % faster here, not 2× faster. **We did not measure the
+reason.** A possible reason is memory traffic: the tensor is 16 MiB, larger
+than the processor caches, and the prefetcher may still load the
+pass-through cache lines. Stage 9 (CPU performance, planned) must
+investigate this before any optimization.
+
+## 9. Practical example
+
+```rust
+use rust_rope::rope::config::{RopeConfig, RopeLayout};
+use rust_rope::rope::embeddings::RotaryEmbedding;
+use rust_rope::rope::position::Position;
+
+let config = RopeConfig::new(4, 10_000.0)?
+    .with_layout(RopeLayout::Interleaved)
+    .with_head_dimension(8)?;
+let rope = RotaryEmbedding::new(config);
+let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+let y = rope.rotate(&x, Position::new(1)?)?;
+assert_eq!(&y[4..], &x[4..]); // components 4..8 unchanged
+assert_ne!(&y[..4], &x[..4]); // components 0..4 rotated
+```
+
+## 10. Test results and what we learned
+
+**Rust tests:** all pass. Stage 7 added 3 unit tests (`config.rs`,
+`validation.rs`), 11 API tests in `rope_tests.rs` (adjacent pairing,
+split-half pairing, split-half example, pair lengths, permutation
+equivalence, partial rotation, `128/64`, `d = D`, invalid rotary dimensions,
+tensors with layouts and partial, tensor head-dimension check), and 3
+numerical tests (all Stage 4 invariants for every layout and partial
+configuration; split-half angles; equal frequencies in both layouts).
+**Python:** 12 self-tests pass; 160 comparison cases pass.
+
+**Mathematics:** partial RoPE is `diag(R_m^(d), I)`; the frequencies use
+`d`; the pass-through components add a position-independent term to the
+score; the relative property still holds.
+
+**Rust:** `split_at_mut` to protect a pass-through region; compatible API
+evolution (new fields with defaults that preserve old behaviour).
+
+
+---
+
+# Stage 8 — RoPE Scaling and Long Context
+
+# Entry 16 — Position interpolation, linear scaling, NTK-aware scaling and YaRN (Stage 8)
+
+**Date:** 2026-11-01
+**Stage:** 8 (RoPE scaling methods)
+**Files:** `src/rope/scaling.rs` (new content), `src/rope/embeddings.rs`
+(`with_scaling`, `scaling`, `attention_factor`), `src/rope/frequencies.rs`
+(`inverse_frequency_unchecked` is now `pub(crate)`),
+`src/utils/validation.rs` (4 new errors, 3 new checks),
+`reference/pytorch_rope.py` (`scaling_parameters`),
+`reference/compare_rope.py`, `reference/test_pytorch_rope.py`,
+`examples/export_reference_cases.rs`, tests, `docs/references.md`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `RopeScaling::None` | ✅ Implemented (bit-identical to standard RoPE) |
+| `RopeScaling::PositionInterpolation { original_context, target_context }` | ✅ Implemented |
+| `RopeScaling::Linear { factor }` | ✅ Implemented |
+| `RopeScaling::NtkAware { factor }` (static NTK-aware, `b' = b·s^(d/(d−2))`) | ✅ Implemented |
+| `RopeScaling::Yarn { factor, original_context, alpha, beta }` (paper formulation) | ✅ Implemented |
+| PyTorch comparison: 128 new scaling cases (288 total) | ✅ All pass |
+| Dynamic NTK (factor depends on the current length) | ❌ Not implemented |
+| The Hugging Face discretization of YaRN (`floor`/`ceil` ramp over dimension indices, `truncate`) | ❌ Not implemented (section 3.7) |
+| LongRoPE, per-pair searched factors | ❌ Not implemented |
+| Fine-tuning (all methods are normally followed by a short fine-tuning) | ❌ Outside the scope: this project has no model |
+
+---
+
+## 1. What did we build?
+
+A scaling module. Each method changes the inverse frequencies `θⱼ` into
+`θ'ⱼ` (and YaRN adds one constant factor). `RotaryEmbedding::with_scaling`
+calculates them one time. The rotation loop did not change.
+
+## 2. Why did we build it?
+
+### 2.1 Why long-context extension is needed
+
+A model is trained with sequences of at most `L` tokens (the **original
+context length**, for example 2048 or 4096). We often want to use it with
+`L' > L` tokens (the **target context length**). Using positions `m ≥ L`
+without any change is called **extrapolation**.
+
+### 2.2 The limitation of standard RoPE
+
+Standard RoPE accepts any position. The mathematics does not break at
+`m = L`. The **model** breaks: during training, each pair `j` only saw the
+angles `φ(m, j) = m·θⱼ` for `0 ≤ m < L`.
+
+Example, `d = 8`, `b = 10000`, `θ = [1, 0.1, 0.01, 0.001]`, `L = 2048`:
+
+| Pair `j` | `θⱼ` | wavelength `2π/θⱼ` | largest trained angle `2047·θⱼ` | angle at `m = 8191` | new? |
+|---|---|---|---|---|---|
+| 0 | 1 | 6.28 | 2047 rad (326 turns) | 8191 rad | no — every direction was seen |
+| 1 | 0.1 | 62.8 | 204.7 rad (32.6 turns) | 819.1 rad | no — every direction was seen |
+| 2 | 0.01 | 628 | 20.47 rad (3.26 turns) | 81.91 rad | partly |
+| 3 | 0.001 | 6283 | **2.047 rad (0.33 turn)** | **8.191 rad** | **yes** — never seen |
+
+**Geometric meaning.** A **high-frequency** pair (large `θⱼ`, short
+wavelength) turns many times inside `L`. All its directions on the circle
+were seen in training; it encodes **local** distance. A **low-frequency**
+pair (small `θⱼ`, long wavelength) turns less than once inside `L`. Its
+direction acts like a "coarse clock" for long distances. Beyond `L`, it
+points into directions that the model **never saw**. Attention scores
+become unreliable. This is why extending the context is **not** only
+"increase a configuration value".
+
+### 2.3 Angles at small and large positions (`d = 8`, `b = 10000`)
+
+| `m` | `j = 0` | `j = 1` | `j = 2` | `j = 3` |
+|---|---|---|---|---|
+| 0 | 0 | 0 | 0 | 0 |
+| 1 | 1 | 0.1 | 0.01 | 0.001 |
+| 2 | 2 | 0.2 | 0.02 | 0.002 |
+| 3 | 3 | 0.3 | 0.03 | 0.003 |
+| 2047 | 2047 | 204.7 | 20.47 | 2.047 |
+| 100 000 | 100 000 | 10 000 | 1000 | 100 |
+
+## 3. Mathematical foundation
+
+### 3.1 The baseline (unchanged)
+
+```text
+θⱼ = 1 / b^(2j/d)          (j = pair index, d = rotary dimension, b = base)
+φ(m, j) = m · θⱼ           (m = token position)
+```
+
+All scaling methods below use the symbols:
+
+| Symbol | Meaning |
+|---|---|
+| `L` | original (training) context length |
+| `L'` | target context length |
+| `s = L'/L` | scaling factor, `s ≥ 1` |
+| `θ'ⱼ` | scaled inverse frequency |
+| `φ'(m, j) = m·θ'ⱼ` | scaled angle |
+
+### 3.2 Position interpolation (Chen et al., 2023)
+
+**Idea:** do not extrapolate. **Compress** the new positions into the
+trained range.
+
+```text
+scale     = L / L'                  (= 1/s ≤ 1)
+m_scaled  = m · scale
+φ'(m, j)  = m_scaled · θⱼ
+```
+
+**Derivation of the property.** The largest new position `L' − 1` maps to
+`(L' − 1)·L/L' = L − L/L' < L`. Thus every scaled position is inside
+`[0, L)`, the trained range, for every pair.
+
+**Example** (`L = 2048`, `L' = 8192`, `m = 4096`):
+
+```text
+scale    = 2048 / 8192 = 0.25
+m_scaled = 4096 · 0.25 = 1024
+angles without scaling: 4096·θ = [4096, 409.6, 40.96, 4.096]
+angles with scaling:    1024·θ = [1024, 102.4, 10.24, 1.024]
+```
+
+The token at position 4096 is rotated exactly like the token at position
+1024 without scaling. The last position 8191 maps to `2047.75`, inside
+`[0, 2048)`. (Test: `interpolated_angles_stay_in_the_trained_range`.)
+
+**Trade-off.** Interpolation divides **every** frequency by `s`. Two
+neighbouring tokens now differ by `θⱼ/s` instead of `θⱼ`. For the fast
+pairs, which encode local word order, the resolution drops by the factor
+`s` (here 4). The scaled positions are also non-integers (`1024.25`,
+`1024.5`, …), which the model never saw. Thus position interpolation needs
+fine-tuning, and it can lose precision for short-range relations.
+
+### 3.3 Linear scaling: positions versus frequencies
+
+```text
+scaling positions:    φ' = (m · (1/s)) · θⱼ
+scaling frequencies:  φ' = m · (θⱼ / s)
+```
+
+Multiplication is associative and commutative: `(m·(1/s))·θ = m·(θ/s)`.
+Thus both give **the same angle**. Many implementations call the frequency
+form "linear" scaling with a `factor = s`. In floating point, the two forms
+can differ by one rounding; for `s = 4` both are exact, because division by
+a power of two is exact (test `position_interpolation_equals_linear_scaling`
+in `scaling.rs` checks bit equality).
+
+**Our implementation.** Both variants exist in the API, so the method is
+explicit:
+
+- `PositionInterpolation { original_context, target_context }` — the
+  context-length form; it checks `1 ≤ L ≤ L'`.
+- `Linear { factor }` — the factor form; it checks `s ≥ 1`.
+
+Both are implemented by the **same** frequency operation (`θ'ⱼ = θⱼ·L/L'`
+or `θⱼ/s`), because positions are integers in this library (`Position`).
+This is not duplicated logic: it is one transformation with two
+parameterizations. The PyTorch reference implements position
+interpolation by scaling the **positions** (`position_ids * L/L'`), so the
+comparison checks the equivalence independently.
+
+### 3.4 NTK-aware scaling (bloc97, 2023)
+
+**The Neural Tangent Kernel at a high level.** The Neural Tangent Kernel
+(NTK, Jacot et al., 2018) describes how a very wide neural network changes
+during training. One result (with Tancik et al., 2020, "Fourier features"):
+networks learn high-frequency details poorly from low-dimensional inputs
+unless the input already contains high-frequency features. For RoPE this
+suggests: **keep the high frequencies**; they carry fine detail that the
+network cannot easily re-learn. Position interpolation destroys exactly
+those. The name "NTK-aware" refers to this argument. It is a heuristic, not
+a theorem.
+
+**Idea:** instead of dividing every `θⱼ` by `s`, change the **base**. This
+changes the frequencies unevenly: high frequencies almost stay, low
+frequencies are interpolated.
+
+**Derivation.** We want:
+
+1. the fastest pair unchanged: `θ'₀ = θ₀ = 1` (automatic: `b'^0 = 1`);
+2. the slowest pair fully interpolated: `θ'_(d/2−1) = θ_(d/2−1) / s`.
+
+With `θ'ⱼ = b'^(−2j/d)` and `j = d/2 − 1` (exponent `(d − 2)/d`):
+
+```text
+b'^(−(d−2)/d) = b^(−(d−2)/d) / s
+b'^((d−2)/d)  = b^((d−2)/d) · s                    (take the reciprocal)
+b'            = b · s^(d/(d−2))                     (raise to the power d/(d−2))
+```
+
+This is the formula of the original post ("NTK-Aware Scaled RoPE", bloc97,
+2023) and of the YaRN paper (section 3.1). It needs `d ≥ 4`: for `d = 2`,
+`d − 2 = 0`.
+
+**How the frequencies change.** `θ'ⱼ/θⱼ = (b'/b)^(−2j/d) = s^(−2j/(d−2))`.
+This goes from `1` (`j = 0`) to `1/s` (`j = d/2 − 1`) geometrically.
+
+**Example** (`d = 8`, `b = 10000`, `s = 4`):
+
+```text
+b' = 10000 · 4^(8/6) = 10000 · 6.3496 = 63 496.04
+θ' = [1, 0.0630, 0.003969, 0.00025]
+θ'/θ = [1, 0.630, 0.397, 0.25]          (= 4^(−2j/6))
+```
+
+**Difference to position interpolation:**
+
+| | Position interpolation | NTK-aware |
+|---|---|---|
+| Fast pair (`j = 0`) | `÷ s` (resolution lost) | unchanged |
+| Slow pair (`j = d/2 − 1`) | `÷ s` | `÷ s` |
+| Middle pairs | `÷ s` | `÷ s^(2j/(d−2))` |
+| What changes | the positions (or all θ) | the base |
+
+**Variants we did not implement.** "Dynamic NTK" recomputes `s` from the
+current sequence length during inference. Other variants use different
+exponents. Our `NtkAware` is the static formula above only.
+
+### 3.5 YaRN (Peng et al., 2023)
+
+**Why simple interpolation reduces positional resolution:** section 3.2.
+**Why NTK-aware is not ideal either:** its ratio `θ'ⱼ/θⱼ` is a smooth
+geometric curve that ignores how many turns a pair makes in the training
+context. Some middle pairs are interpolated although they turned many times
+in `L` (no extrapolation problem), and the slowest pairs can still be
+slightly extrapolated.
+
+YaRN ("Yet another RoPE extensioN method") uses the **number of turns in
+the original context** to decide, per pair:
+
+```text
+λⱼ   = 2π / θⱼ                      wavelength (positions per turn)
+r(j) = L / λⱼ                       turns of pair j inside the training context
+```
+
+- `r(j) > β`: the pair turned many times in training. **Do not
+  interpolate** (keep `θⱼ`): high-frequency band.
+- `r(j) < α`: the pair turned less than `α` times. **Interpolate fully**
+  (`θⱼ / s`): low-frequency band.
+- in between: blend linearly.
+
+**The correction range** is `[α, β]` in units of "turns in `L`". The paper
+uses `α = 1`, `β = 32` for LLaMA models.
+
+**The blending (ramp) function:**
+
+```text
+γ(r) = 0                    if r < α
+     = 1                    if r > β
+     = (r − α) / (β − α)    otherwise
+
+θ'ⱼ = (1 − γ(r(j))) · θⱼ / s  +  γ(r(j)) · θⱼ
+```
+
+`γ = 1` keeps the frequency; `γ = 0` interpolates it; values in between
+mix the two.
+
+**The attention scaling factor.** The paper observes that interpolation
+makes the attention softmax distribution flatter (lower "temperature"
+effect on the logits). YaRN multiplies the logits by `1/t` with:
+
+```text
+√(1/t) = 0.1 · ln(s) + 1
+```
+
+Implementations multiply **both** the rotated query and the rotated key by
+`√(1/t)` (equivalently: multiply `cos φ` and `sin φ` by it), so the score
+`qᵀk` is multiplied by `1/t`. Our `RotaryEmbedding` does exactly this: it
+multiplies the rotated components by `attention_factor()`. Thus a YaRN
+rotation is **no longer length-preserving**: lengths grow by the factor
+`0.1·ln(s) + 1`. The pass-through components of partial RoPE are not
+multiplied (the same as scaling `cos` and `sin`).
+
+**Example** (`d = 8`, `b = 10000`, `L = 2048`, `s = 4`, `α = 1`, `β = 32`):
+
+| `j` | `θⱼ` | `λⱼ` | `r(j) = 2048/λⱼ` | `γ` | `θ'ⱼ` | `θ'ⱼ/θⱼ` |
+|---|---|---|---|---|---|---|
+| 0 | 1 | 6.28 | 325.9 | 1 | 1 | 1 |
+| 1 | 0.1 | 62.8 | 32.59 | 1 | 0.1 | 1 |
+| 2 | 0.01 | 628.3 | 3.259 | `(3.259 − 1)/31 = 0.0729` | `0.9271·0.0025 + 0.0729·0.01 = 0.003047` | 0.305 |
+| 3 | 0.001 | 6283 | 0.326 | 0 | 0.00025 | 0.25 |
+
+Attention factor: `0.1·ln 4 + 1 = 1.1386`; the score factor `1/t` is
+`1.1386² = 1.2965`.
+
+Compare with NTK-aware for the same case: pair 1 is `÷1.59` under NTK, but
+unchanged under YaRN, because it turns 32.6 times in `L`.
+
+### 3.6 Which formulation we implement, and why
+
+We implement the formulas of the **YaRN paper** (Peng et al., 2023,
+sections 3.2 "NTK-by-parts" and 3.4 "YaRN"): a continuous ramp `γ(r)` over
+the number of turns `r`, and `√(1/t) = 0.1·ln(s) + 1`. These formulas are
+clearly defined and need only `s`, `L`, `α`, `β`.
+
+### 3.7 A known difference: the Hugging Face / reference-code discretization
+
+The published code (and Hugging Face `transformers`) computes the ramp in a
+different way. It converts the boundaries `β` ("beta_fast") and `α`
+("beta_slow") into **dimension indices**, rounds them with `floor` and
+`ceil`, and ramps linearly over the dimension index. This gives similar but
+**not identical** frequencies for the pairs inside the ramp. It also has
+options (`truncate`, `mscale`, `mscale_all_dim`) that some models use.
+**Our implementation does not reproduce these details**, and we do not
+claim equality with the Hugging Face output. Our PyTorch reference
+implements the paper's formulation independently.
+
+### 3.8 Numerical precision
+
+- All methods change `θⱼ` once; the angle error model of Entry 13 is
+  unchanged: about `ε·(1 + m·θ'₀)`. Scaling makes the angles **smaller**
+  (`θ'ⱼ ≤ θⱼ`), so it does not increase the error.
+- NTK-aware: `s^(d/(d−2))` and `b'^(−2j/d)` add one or two roundings to
+  `θ'ⱼ` (relative `≈ 2ε`).
+- YaRN: the ramp introduces `ln`, divisions and a blend; all relative
+  `≈ few ε`.
+- Measured agreement with PyTorch (float64): at most `2.2 × 10⁻¹²`
+  (section 9).
+
+## 4. Rust concepts learned
+
+### 4.1 An enum with data for the method
+
+```rust
+pub enum RopeScaling {
+    None,
+    PositionInterpolation { original_context: usize, target_context: usize },
+    Linear { factor: f64 },
+    NtkAware { factor: f64 },
+    Yarn { factor: f64, original_context: usize, alpha: f64, beta: f64 },
+}
+```
+
+Each variant carries exactly the parameters that its method needs. A
+`Linear` value cannot have an `alpha`; a `Yarn` value cannot be created
+without `original_context`. A struct with optional fields
+(`factor: Option<f64>, alpha: Option<f64>, …`) would allow meaningless
+combinations. In memory, the enum is as large as its largest variant
+(`Yarn`: 32 bytes) plus a tag.
+
+### 4.2 `match *self` and binding fields
+
+```rust
+match *scaling {
+    RopeScaling::Linear { factor } => theta.iter_mut().for_each(|t| *t /= factor),
+    RopeScaling::Yarn { factor, original_context, alpha, beta } => { /* ... */ }
+    // ...
+}
+```
+
+The pattern `Linear { factor }` **binds** the field to a local variable
+`factor`. `*scaling` dereferences the reference; this is allowed because
+the enum is `Copy`. `RopeScaling::Yarn { factor, .. }` in
+`attention_factor` ignores the other fields with `..`; `_ => 1.0` matches
+all remaining variants.
+
+### 4.3 Validation per variant
+
+`RopeScaling::validate(&self, &RopeConfig)` checks each variant with the
+functions in `utils::validation`. `with_scaling` calls it before it
+calculates anything (`?`), so an invalid method never produces a
+`RotaryEmbedding`.
+
+### 4.4 `iter_mut().for_each` and in-place frequency changes
+
+`theta.iter_mut().for_each(|t| *t *= scale)` changes every element of the
+`Vec` in place. `t` is `&mut f64`; `*t *= scale` writes through it. No new
+`Vec` is allocated: `scaled_inverse_frequencies` allocates exactly one
+`Vec` (the same as the unscaled path).
+
+### 4.5 Keeping scaling out of the rotation loop
+
+The only change to the hot loop is `pair[0] = ra * factor`. For every
+method except YaRN, `factor = 1.0`, and IEEE 754 guarantees `x · 1.0 = x`
+exactly. Thus `RopeScaling::None` gives **bit-identical** output to Stage 7
+(test `scaling_none_gives_bit_identical_standard_rope`). The cost is two
+multiplications per pair (not measured separately; Stage 9).
+
+## 5. Memory and execution
+
+- `RotaryEmbedding` grows by the `RopeScaling` value (40 B with the tag)
+  and one `f64`.
+- `with_scaling`: one allocation of `d/2` values; YaRN does `d/2`
+  divisions, one `ln`, and `d/2` ramp evaluations; NTK does one `powf` for
+  `b'` and `d/2` `powf` for `θ'ⱼ`. All of it happens one time.
+- Rotation: unchanged, plus 2 multiplications per pair.
+
+## 6. Engineering decisions
+
+1. **Scaling is a property of `RotaryEmbedding`, not of `RopeConfig`.**
+   `RopeConfig` defines the geometry (dimensions, base, layout); scaling is
+   a modification for deployment. `RotaryEmbedding::new(config)` keeps the
+   old behaviour.
+2. **Everything becomes frequencies.** One code path for all methods; the
+   rotation loop stays simple.
+3. **Integer positions stay integers**: position interpolation is applied
+   to the frequencies, which is mathematically identical.
+4. **Explicit variants instead of one "factor" field**, and two variants
+   for the same linear transformation, because the task asked for an
+   explicit API and because the context-length form validates `L ≤ L'`.
+5. **The YaRN paper formulation**, documented as different from the
+   Hugging Face discretization.
+6. **`s ≥ 1` everywhere.** `s < 1` is not a context extension.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Scaling inside `RopeConfig` | One object | Mixes model geometry with deployment changes |
+| A trait `ScalingMethod` with one type per method | Extensible by users | Generics or `dyn` in `RotaryEmbedding`; more code; a closed enum is sufficient |
+| `f64` positions for position interpolation | Literal formula | Loses the integer guarantees of `Position` |
+| The Hugging Face YaRN discretization | Numerically equal to HF models | More parameters and rounding rules; not the paper's formula |
+| Dynamic NTK | Better without fine-tuning for short inputs | The frequencies depend on the input length; a cache per length |
+
+## 8. Performance considerations
+
+- The scaling cost is paid one time in `with_scaling` (`O(d)`).
+- The rotation cost does not depend on the method (2 extra multiplications
+  per pair for all methods).
+- No allocation in the rotation path.
+
+## 9. Test results
+
+**Rust** (`cargo test`, 2026-11-01): **all 298 tests pass** (171 unit,
+43 numerical, 58 API, 26 doc tests). New Stage 8 tests: 6 unit tests in
+`scaling.rs` and 1 in `validation.rs`; 8 API tests (none = bit-identical,
+factor 1 = standard, position-interpolation angles, longer targets give
+slower frequencies, methods are distinguishable, invalid configurations,
+both layouts + partial + tensors, YaRN factor only on the rotary part); 5
+numerical tests (PI = standard RoPE at `m/4`, angles inside the trained
+range, relative property with scaling, NTK for `d = 4…128`, stability up
+to `m = 10⁷` with `s = 64`).
+
+**Python** (`unittest`): **16 tests pass**, including the negative control
+"the comparison detects a missing scaling method" for every scaled case
+with `m ≥ 4096`.
+
+**PyTorch comparison:** **all 288 cases pass** in float64 and float32
+(128 new scaling cases: 3 dimensions × 4 positions + 4 tensor cases with
+both layouts and partial RoPE, for 8 method settings).
+
+| Method | float64 max abs | float32 max abs |
+|---|---|---|
+| PositionInterpolation 2048→8192 | `2.5 × 10⁻¹³` | `2.5 × 10⁻⁴` |
+| Linear `s = 4` | `2.5 × 10⁻¹³` | `2.5 × 10⁻⁴` |
+| Linear `s = 2.5` | `4.9 × 10⁻¹³` | `3.8 × 10⁻⁴` |
+| Linear `s = 1` | `9.9 × 10⁻¹³` | `1.3 × 10⁻³` |
+| NtkAware `s = 4` | `2.2 × 10⁻¹²` | `1.2 × 10⁻³` |
+| NtkAware `s = 8` | `1.2 × 10⁻¹²` | `8.6 × 10⁻⁴` |
+| YaRN `s = 4`, `L = 2048` | `1.1 × 10⁻¹²` | `1.5 × 10⁻³` |
+| YaRN `s = 16`, `L = 4096` | `1.3 × 10⁻¹²` | `1.7 × 10⁻³` |
+
+Position interpolation and `Linear s = 4` give identical error statistics:
+the PyTorch reference scales the positions, Rust scales the frequencies,
+and both agree with the Rust output to the same digits.
+
+**Why relative error near zero can mislead:** see Entry 13, section 3.2.
+The comparison computes it only for values above `10⁻³ · max|p|`.
+
+## 10. Known limitations and what we learned
+
+**Limitations:** no fine-tuning (scaling methods are designed to be
+followed by a short fine-tuning; this project only implements the
+transformation); no dynamic NTK; YaRN is the paper formulation, not the
+Hugging Face discretization; no LongRoPE.
+
+**Mathematics:** extrapolation fails for the low-frequency pairs, whose
+angles leave the trained range; position interpolation compresses every
+position into `[0, L)` at the cost of local resolution;
+`(m/s)·θ = m·(θ/s)`; NTK-aware scaling changes the base to
+`b·s^(d/(d−2))`, which keeps `θ₀` and divides the slowest pair by `s`;
+YaRN decides per pair from `r = L/λ` with a ramp `γ` and adds the
+attention factor `0.1·ln s + 1`.
+
+**Rust:** an enum whose variants carry exactly their own parameters;
+`match` with field binding and `..`; validation per variant; in-place
+changes with `iter_mut`; keeping a feature out of the hot loop.
+
+---
+
+## Roadmap status after Entry 16
+
+The roadmap tables after Entries 6 and 9 show the state at those times.
+This table shows the current state, with the redefined stage numbers.
+
+| Stage | Status |
+|---|---|
+| 1 Project foundation | ✅ Done (Entry 1) |
+| 2 Mathematical foundations | ✅ Done (Entries 2–6) |
+| 3 Frequencies, positions, angles | ✅ Done (Entries 7–9) |
+| 4 RoPE transformation of a vector | ✅ Done (Entry 10) |
+| 5 Query and key tensors | ✅ Done (Entries 11–12) |
+| 6 PyTorch reference validation | ✅ Done (Entry 13) |
+| 7 Layouts and partial RoPE | ✅ Done (Entries 14–15) |
+| 8 RoPE scaling | ✅ Done (Entry 16) — review pending |
+| 9 CPU performance engineering | ⏳ Planned — waits for approval |
