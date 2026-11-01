@@ -6,10 +6,13 @@
 fn main() {
     // `env!` reads a value at compile time. Cargo sets these variables.
     println!(
-        "{} v{} — Stage 2: mathematical foundations complete.",
+        "{} v{} — Stage 3: RoPE frequencies, positions and angles complete.",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
-    println!("No RoPE algorithms are implemented yet. See README.md for the roadmap.");
+    println!("Embedding rotation is not implemented yet (Stage 4). See README.md for the roadmap.");
     println!("Run `cargo run --example math_foundations` to see the Stage 2 mathematics.");
+    println!(
+        "Run `cargo run --example rope_frequencies` to see the Stage 3 frequencies and angles."
+    );
 }

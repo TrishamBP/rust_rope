@@ -1,5 +1,9 @@
 //! Shared utilities.
 //!
-//! Status: planned. The submodules are empty in Stage 1.
+//! ## Status (Stage 3)
+//!
+//! - [`validation`]: the error type [`validation::RopeError`] and the input
+//!   checks for the embedding dimension, the frequency base, token positions
+//!   and inverse frequencies. Implemented.
 
 pub mod validation;

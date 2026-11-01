@@ -1,12 +1,12 @@
-# rust_rope
+# Rust ROPE
 
 An educational, from-scratch implementation of **Rotary Position Embeddings
 (RoPE)** in Rust.
 
-> **Status:** Stage 2 complete — mathematical foundations. The `math`
-> module (vectors, complex numbers, trigonometry, 2 × 2 rotation matrices,
-> Euler's formula) is implemented and tested. No RoPE algorithm is
-> implemented yet (Stage 3 is next).
+> **Status:** Stage 3 complete (review pending) — RoPE fundamentals. The
+> library calculates the inverse frequencies `θⱼ = b^(−2j/d)`, token
+> positions, and the positional angles `m·θⱼ`. It does not rotate embedding
+> vectors yet (Stage 4).
 
 ---
 
@@ -55,12 +55,12 @@ mechanism that tells it where each token is.
 
 ## 4. Why is RoPE different from traditional positional embeddings?
 
-| Method | How it adds position | Limitation |
-|---|---|---|
-| Sinusoidal absolute (Vaswani et al., 2017) | **Adds** a fixed sine/cosine vector to the embedding | The model must learn to extract relative distance |
-| Learned absolute | **Adds** a trained vector for each position | Fixed maximum length; no direct relative information |
-| Relative bias (for example, T5) | Adds a learned bias to the attention scores | Extra parameters and extra calculation in attention |
-| **RoPE** | **Rotates** the query and key vectors | Needs scaling methods for very long contexts |
+| Method                                     | How it adds position                                 | Limitation                                           |
+| ------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------- |
+| Sinusoidal absolute (Vaswani et al., 2017) | **Adds** a fixed sine/cosine vector to the embedding | The model must learn to extract relative distance    |
+| Learned absolute                           | **Adds** a trained vector for each position          | Fixed maximum length; no direct relative information |
+| Relative bias (for example, T5)            | Adds a learned bias to the attention scores          | Extra parameters and extra calculation in attention  |
+| **RoPE**                                   | **Rotates** the query and key vectors                | Needs scaling methods for very long contexts         |
 
 The key property of RoPE: a rotation keeps the length of a vector. And the
 dot product of a query at position `m` and a key at position `n` depends only
@@ -86,12 +86,14 @@ attention sees relative positions. RoPE adds no trainable parameters.
 Legend: ✅ done · 🔄 in progress · ⏳ planned
 
 ### Stage 1: Project foundation — ✅
+
 - Rust project initialization. ✅
 - Module structure. ✅
 - Rust development conventions. ✅
 - Documentation setup. ✅
 
 ### Stage 2: Mathematical foundations — ✅
+
 - Vectors and matrices. ✅ `math::matrix::{Vector, Matrix2}`
 - Complex numbers. ✅ `math::complex::Complex`
 - Trigonometric functions. ✅ `math::trigonometry`
@@ -100,19 +102,25 @@ Legend: ✅ done · 🔄 in progress · ⏳ planned
 - Euler's formula. ✅ `Complex::from_polar`
 - Shared float comparison. ✅ `math::approx_eq`
 
-### Stage 3: RoPE fundamentals — ⏳
-- Positional frequencies.
-- Inverse frequency calculations.
-- Position-dependent angles.
-- Applying rotations to embedding dimensions.
+### Stage 3: RoPE fundamentals — ✅
+
+- Positional frequencies. ✅ `rope::config::RopeConfig`
+- Inverse frequency calculations. ✅ `rope::frequencies::{inverse_frequency, inverse_frequencies}`
+- Position indexing. ✅ `rope::position::{Position, PositionRange}`
+- Position-dependent angles. ✅ `rope::frequencies::{angle, AngleTable}`
+- Input validation. ✅ `utils::validation::RopeError`
+- Applying rotations to embedding dimensions. ⏳ Moved to Stage 4 (the
+  Stage 3 scope excludes vector rotation).
 
 ### Stage 4: RoPE implementation — ⏳
+
 - Pairwise dimension rotations.
 - Different dimension layouts.
 - Embedding transformations.
 - Numerical validation.
 
 ### Stage 5: Advanced RoPE — ⏳
+
 - Frequency scaling.
 - Extended context techniques.
 - NTK-aware scaling.
@@ -120,6 +128,7 @@ Legend: ✅ done · 🔄 in progress · ⏳ planned
 - Comparison of RoPE variants.
 
 ### Stage 6: Performance engineering — ⏳
+
 - Memory allocation analysis.
 - Stack versus heap.
 - Cache locality.
@@ -128,6 +137,7 @@ Legend: ✅ done · 🔄 in progress · ⏳ planned
 - Optimizing CPU execution.
 
 ### Stage 7: Validation and experimentation — ⏳
+
 - Unit tests.
 - Numerical tests.
 - Mathematical invariants.
@@ -153,6 +163,7 @@ cargo build                    # Build the library and the binary
 cargo run                      # Run the demonstration binary (src/main.rs)
 cargo test                     # Run unit tests and integration tests
 cargo run --example math_foundations # Print the Stage 2 numerical examples
+cargo run --example rope_frequencies # Print the Stage 3 frequencies and angles
 cargo run --example basic_rope # Run the RoPE example (placeholder)
 cargo bench                    # Run the benchmarks (optimized build)
 cargo fmt                      # Format the code

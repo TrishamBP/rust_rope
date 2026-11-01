@@ -4,7 +4,24 @@
 //! Rotary Position Embeddings. It uses the general primitives in
 //! [`crate::math`].
 //!
-//! Status: planned. The submodules are empty in Stage 1.
+//! ## Status (Stage 3)
+//!
+//! - [`config`]: `RopeConfig` (dimension `d`, base `b`). Implemented.
+//! - [`frequencies`]: inverse frequencies `θⱼ = b^(−2j/d)` and positional
+//!   angles `m · θⱼ` (`AngleTable`). Implemented.
+//! - [`position`]: `Position` and `PositionRange`. Implemented.
+//! - [`rotations`], [`embeddings`]: planned (Stage 4).
+//! - [`scaling`]: planned (Stage 5).
+//!
+//! ## Data flow
+//!
+//! ```text
+//! RopeConfig (d, b) ──► inverse_frequencies ──► [θ₀, ..., θ_(d/2−1)]
+//!                                                      │
+//! PositionRange (start, L) ─────────────────────────────┤
+//!                                                      ▼
+//!                                AngleTable: φ(m, j) = m · θⱼ
+//! ```
 
 pub mod config;
 pub mod embeddings;

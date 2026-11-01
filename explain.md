@@ -23,6 +23,9 @@ Each implementation milestone adds one new entry.
 | 4 | 2026-10-31 | Stage 2 | Trigonometry (radians, unit circle, periodicity, precision) |
 | 5 | 2026-10-31 | Stage 2 | 2 × 2 matrices and rotation matrices (`Matrix2`, `R(θ)`) |
 | 6 | 2026-10-31 | Stage 2 | Euler's formula and rotation by complex multiplication |
+| 7 | 2026-11-01 | Stage 3 | Configuration, validation and inverse frequencies (`RopeConfig`, `RopeError`, `θⱼ = b^(−2j/d)`) |
+| 8 | 2026-11-01 | Stage 3 | Position indexing (`Position`, `PositionRange`, the `2^53` limit) |
+| 9 | 2026-11-01 | Stage 3 | Positional angles `φ(m, j) = m·θⱼ` and the `AngleTable`; link to `R(m, j)` |
 
 ---
 
@@ -3271,3 +3274,1658 @@ shows the state at that time. This table shows the current state.
 | 5 Advanced RoPE | ⏳ Planned |
 | 6 Performance engineering | ⏳ Planned |
 | 7 Validation and experimentation | ⏳ Planned |
+
+
+---
+
+# Entry 7 — Configuration, validation and inverse frequencies (Stage 3, Component 1)
+
+**Date:** 2026-11-01
+**Stage:** 3 (RoPE fundamentals)
+**Files:** `src/utils/validation.rs`, `src/rope/config.rs`,
+`src/rope/frequencies.rs` (the frequency part), `tests/rope_tests.rs`,
+`tests/numerical_tests.rs`, `examples/rope_frequencies.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `RopeError` (one error enum for all invalid RoPE input) | ✅ Implemented |
+| `validate_dimension`, `validate_base` | ✅ Implemented |
+| `RopeConfig { d, b }`, `DEFAULT_BASE = 10000` | ✅ Implemented |
+| `inverse_frequency(config, j)` = `θⱼ` | ✅ Implemented |
+| `inverse_frequencies(config)` = `[θ₀, ..., θ_(d/2−1)]` | ✅ Implemented |
+| Positions and angles | ✅ Implemented in Entries 8 and 9 |
+| Sine, cosine and rotation of embeddings | ⏳ Planned (Stage 4) |
+| Frequency scaling (NTK, YaRN) | ⏳ Planned (Stage 5) |
+
+---
+
+## 1. What did we build?
+
+We built the first RoPE-specific code. It calculates the **inverse
+frequencies** `θⱼ`. An inverse frequency is the rotation speed of one pair of
+dimensions, in radians per token position.
+
+The code has three parts:
+
+1. `utils::validation` checks the input. It has one error type,
+   `RopeError`, and one check function for each kind of input.
+2. `rope::config::RopeConfig` holds the two parameters of the formula: the
+   embedding dimension `d` and the frequency base `b`. It checks both values
+   when you create it.
+3. `rope::frequencies` calculates `θⱼ = b^(−2j/d)` for one pair or for all
+   pairs.
+
+## 2. Why did we build it?
+
+RoPE rotates each pair of embedding dimensions by an angle. The angle is the
+token position `m` multiplied by the rotation speed `θⱼ` of the pair. Thus
+we must know `θⱼ` before we can calculate an angle, and we must know the angle
+before we can rotate. The frequencies are the first step of the data flow:
+
+```text
+(d, b) ──► θⱼ ──► φ = m·θⱼ ──► cos φ, sin φ ──► rotation of the pair
+ this entry       Entry 9        Stage 4          Stage 4
+```
+
+## 3. Mathematical foundation
+
+### 3.1 Notation: `i` in the task, `j` in the project
+
+The task text writes the formula as `θ_i = 1 / base^(2i/d)`. The project
+uses `j` for the pair index, because `i` is the imaginary unit `√−1` in
+`src/math/complex.rs` (see `docs/mathematics.md`, section 1). The two
+formulas are identical. Only the name of the index is different:
+
+```text
+θ_i = 1 / base^(2i/d)       (task notation)
+θⱼ  = 1 / b^(2j/d)          (project notation)
+```
+
+### 3.2 The variables
+
+| Symbol | Name | Meaning | Example |
+|---|---|---|---|
+| `d` | rotary embedding dimension | The number of dimensions that RoPE rotates. Usually the dimension of one attention head. It must be even. | 8, 64, 128 |
+| `P = d/2` | number of pairs | RoPE groups the `d` dimensions into `d/2` pairs. | 4 for `d = 8` |
+| `j` | dimension-pair index | Selects one pair. `j = 0, 1, ..., d/2 − 1`. Pair `j` holds the dimensions `2j` and `2j + 1`. | 0, 1, 2, 3 |
+| `b` | frequency base | A constant that sets the slowest rotation speed. | 10000 |
+| `θⱼ` | inverse frequency of pair `j` | The angle in radians that pair `j` rotates for each step of one token position. | 1, 0.1, 0.01, 0.001 |
+
+**Why "inverse frequency"?** In physics, a frequency counts cycles per unit
+of time. Here, `θⱼ` is an angle per position. The name comes from the form
+`θⱼ = 1 / b^(2j/d)`: it is "one divided by" the number `b^(2j/d)`. Also,
+the wavelength of pair `j` (section 3.7) is proportional to `1/θⱼ`.
+
+### 3.3 Why RoPE uses different frequencies for different pairs
+
+Imagine that all pairs use the same speed, for example `θ = 1` radian per
+position. Then the angle at position `m` is `m` radians. A rotation by `2π`
+(one full turn) is the same as no rotation. Thus the position information
+**wraps around**. Example: `44 mod 2π ≈ 0.0177` (measured with `f64`).
+Thus position 44 has almost the same rotation as position 0. The model cannot
+separate the two positions.
+
+Now imagine that all pairs use a very slow speed, for example
+`θ = 0.0001`. Then the rotation does not wrap around for 62 832 positions.
+But neighbouring positions get almost the same angle (difference 0.0001
+radian). The model cannot separate position 5 from position 6.
+
+A clock solves the same problem with several hands. The second hand moves
+fast: it separates neighbouring seconds, but it repeats every minute. The
+hour hand moves slowly: it never repeats in one day, but it cannot show
+seconds. **Together**, the hands show the time without ambiguity.
+
+RoPE uses `d/2` "hands" with speeds from fast (`θ₀ = 1`) to slow
+(`θ_(d/2−1) ≈ 1/b`). Fast pairs encode small distances. Slow pairs encode
+large distances.
+
+### 3.4 Why the exponent is `2j/d`
+
+The exponent `2j/d` has two parts: `2j` and the division by `d`.
+
+**Part 1: why `2j` and not `j`.** Pair `j` holds the dimensions `2j` and
+`2j + 1`. Thus `2j` is the **index of the first dimension** of the pair.
+The exponent `2j/d` is "the dimension index divided by the dimension". The
+original Transformer (Vaswani et al., 2017) uses the same exponent in its
+sinusoidal position encoding: `PE(pos, 2i) = sin(pos / 10000^(2i/d))`.
+RoPE keeps this formula.
+
+There is a second view. `2j/d = j/(d/2) = j/P`. This is the pair index
+divided by the number of pairs: the **fraction of the pairs** before pair
+`j`. It goes from 0 (first pair) to almost 1 (last pair).
+
+What happens with `j/d` instead? The exponent then goes only from 0 to about
+`0.5`. The slowest speed is `b^(−0.5) = 1/√b = 0.01` for `b = 10000`. The
+pairs use only half of the available speed range, and the longest wavelength
+is only about 628 positions instead of up to almost 62 832.
+
+**Part 2: why we divide by `d`.** The division **normalizes** the exponent
+to the range `[0, 1)`. Thus the speed range is always from `1` down to about
+`1/b`, for every dimension `d`. The dimension controls only how many speeds
+lie in this range, not the range itself.
+
+What happens without the division? With `θⱼ = b^(−2j)` and `d = 128`, the
+last pair has `θ₆₃ = 10000^(−126) = 10^(−504)`. This is smaller than the
+smallest positive `f64` (about `4.9e−324`). We measured: `f64` gives exactly
+`0`. Even for small `d`, the speeds would fall by a factor of `b² = 10⁸`
+from one pair to the next. Most pairs would never rotate.
+
+### 3.5 Why the exponent increases with `j`, and why `θⱼ` decreases
+
+The exponent `2j/d` increases by `2/d` for each step of `j`:
+
+```text
+j:       0      1      2      ...    d/2 − 1
+2j/d:    0      2/d    4/d    ...    (d − 2)/d
+```
+
+For `b > 1`, the power `b^x` is an **increasing** function of `x`. Proof:
+`b^x = e^(x·ln b)`, and `ln b > 0` for `b > 1`. A larger `x` gives a larger
+exponent `x·ln b`, and `e^y` increases with `y`.
+
+Thus `b^(2j/d)` increases with `j`, and its inverse `θⱼ = 1/b^(2j/d)`
+**decreases** with `j`. The higher the pair index, the slower the pair.
+(Test: `inverse_frequencies_decrease_strictly`.)
+
+This is also the reason for the rule `b > 1` (section 6). With `b = 1`, all
+`θⱼ = 1`. With `0 < b < 1`, `ln b < 0`, and the order is reversed.
+
+### 3.6 A geometric sequence
+
+Divide two neighbouring frequencies:
+
+```text
+θ_(j+1) / θⱼ = b^(−2(j+1)/d) / b^(−2j/d) = b^(−2(j+1)/d + 2j/d) = b^(−2/d)
+```
+
+The ratio `r = b^(−2/d)` does not depend on `j`. A sequence with a constant
+ratio is a **geometric sequence**: `θⱼ = r^j`. The logarithm is a straight
+line:
+
+```text
+ln θⱼ = −(2j/d)·ln b
+```
+
+Thus the speeds are **evenly spaced on a logarithmic scale**. Each pair is
+slower than the previous pair by the same factor. (Test:
+`inverse_frequencies_form_a_geometric_sequence`.)
+
+**The range.** `0 ≤ 2j/d ≤ (d − 2)/d < 1`. Thus:
+
+```text
+1/b < θⱼ ≤ 1
+```
+
+`θ₀ = 1` exactly. The last value `θ_(d/2−1) = b^(−(d−2)/d)` is a little
+larger than `1/b`. (Test: `inverse_frequencies_stay_between_one_over_base_and_one`.)
+
+### 3.7 The wavelength of a pair
+
+A pair returns to its start direction after a full turn, `2π` radians. At a
+speed of `θⱼ` radians per position, this takes:
+
+```text
+λⱼ = 2π / θⱼ = 2π · b^(2j/d)      positions
+```
+
+`λⱼ` is the **wavelength** of pair `j`. It goes from `2π ≈ 6.28` positions
+(pair 0) to almost `2π·b ≈ 62 832` positions (last pair, `b = 10000`).
+
+### 3.8 Numerical derivation: `d = 8`, `b = 10000`
+
+`d = 8` gives `P = 8/2 = 4` pairs: `j = 0, 1, 2, 3`.
+We write `b = 10000 = 10⁴`. Then `b^x = (10⁴)^x = 10^(4x)`.
+
+**Pair `j = 0`** (dimensions 0 and 1):
+
+```text
+exponent = 2·0 / 8 = 0 / 8 = 0
+b^0      = 10000^0 = 1                  (every number to the power 0 is 1)
+θ₀       = 1 / 1 = 1
+```
+
+**Pair `j = 1`** (dimensions 2 and 3):
+
+```text
+exponent = 2·1 / 8 = 2/8 = 0.25
+b^0.25   = (10⁴)^0.25 = 10^(4·0.25) = 10^1 = 10      (the fourth root of 10000)
+θ₁       = 1 / 10 = 0.1
+```
+
+**Pair `j = 2`** (dimensions 4 and 5):
+
+```text
+exponent = 2·2 / 8 = 4/8 = 0.5
+b^0.5    = (10⁴)^0.5 = 10^2 = 100                    (the square root of 10000)
+θ₂       = 1 / 100 = 0.01
+```
+
+**Pair `j = 3`** (dimensions 6 and 7):
+
+```text
+exponent = 2·3 / 8 = 6/8 = 0.75
+b^0.75   = (10⁴)^0.75 = 10^3 = 1000
+θ₃       = 1 / 1000 = 0.001
+```
+
+**Summary:**
+
+| `j` | dimensions | `2j/d` | `b^(2j/d)` | `θⱼ` | wavelength `2π/θⱼ` |
+|---|---|---|---|---|---|
+| 0 | 0, 1 | 0 | 1 | 1 | 6.28 |
+| 1 | 2, 3 | 0.25 | 10 | 0.1 | 62.83 |
+| 2 | 4, 5 | 0.5 | 100 | 0.01 | 628.32 |
+| 3 | 6, 7 | 0.75 | 1000 | 0.001 | 6283.19 |
+
+**Interpretation.**
+
+- The ratio is `r = 10000^(−2/8) = 10^(−1) = 0.1`. Each pair is 10 times
+  slower than the previous pair.
+- Pair 0 makes a full turn every 6.28 tokens. It separates neighbouring
+  tokens well, but it repeats often.
+- Pair 3 needs 6283 tokens for one turn. In a sequence of 100 tokens it
+  turns only `0.1` radian. Its angle changes slowly and never repeats, so it
+  carries "coarse" long-distance information.
+- `d = 8` is small, so the ratio is large (0.1). With `d = 128`, the ratio is
+  `10000^(−2/128) = 10^(−1/16) ≈ 0.866`. The 64 speeds then cover the same
+  range `(1/b, 1]`, but much more densely.
+
+### 3.9 Other dimensions and bases
+
+Measured with `cargo run --example rope_frequencies` (`b = 10000`):
+
+| `d` | pairs | ratio `b^(−2/d)` | `θ₁` | last `θ` | longest wavelength |
+|---|---|---|---|---|---|
+| 8 | 4 | 0.1 | 0.1 | 1.0e−3 | 6 283 |
+| 64 | 32 | 0.7499 | 7.498942e−1 | 1.333521e−4 | 47 117 |
+| 128 | 64 | 0.8660 | 8.659643e−1 | 1.154782e−4 | 54 410 |
+
+A **larger base** makes every pair (except pair 0) slower, because
+`b^(−x)` decreases with `b` for a fixed `x > 0`. Some models use
+`b = 500 000` (LLaMA 3) or `b = 1 000 000`, so that the slow pairs do not
+wrap around in very long contexts. (Test: `larger_base_gives_slower_pairs`.)
+Stage 5 studies this in detail.
+
+### 3.10 Numerical precision
+
+- We use `f64`. An `f64` has 53 significant bits (about 16 decimal digits).
+- **`θ₀ = 1` is exact.** IEEE 754 (the floating-point standard) defines
+  `pow(x, ±0) = 1` for every `x`. (Test: `first_frequency_is_exactly_one`.)
+- **Exact exponents.** For `d = 8`, the exponents `0, 0.25, 0.5, 0.75` are
+  exact binary fractions. For `d = 128`, `2j/128 = j/64` is also exact. For
+  `d = 6`, `2/6 = 1/3` is not exact, so the exponent itself has a rounding
+  error of about `1e−16`.
+- **One rounding, not two.** We calculate `b.powf(−x)`, not
+  `1.0 / b.powf(x)`. The second form rounds two times (the power and the
+  division). For `d = 8`, both forms happen to give the same `f64` values
+  (`0.1`, `0.01`, `0.001` are the nearest `f64` values to the exact results).
+- **The printed ratio.** `θ₂/θ₁` prints as `0.09999999999999999`. The value
+  `0.1` has no exact binary representation, so `0.01 / 0.1` in `f64` is not
+  exactly `0.1`. This is a rounding effect of the division, not an error in
+  `θ`.
+- **`f32` comparison.** We measured: `f32` gives inverse frequencies with a
+  relative error of up to `5.4e−8` (compared with `f64`). Many Python
+  implementations use `f32`. Entry 9 shows the effect of this error on large
+  angles.
+
+### 3.11 Where a Transformer uses this
+
+The inverse frequencies depend only on `d` and `b`, not on the input text.
+Thus a model calculates them **one time**. All attention layers and all
+heads use the same list. Many implementations store the list as a constant
+buffer with the name `inv_freq`. The model has no trainable parameter for
+RoPE.
+
+## 4. Rust concepts learned
+
+### 4.1 An `enum` with data for errors
+
+```rust
+pub enum RopeError {
+    ZeroDimension,
+    OddDimension { dimension: usize },
+    InvalidBase { base: f64 },
+    // ...
+}
+```
+
+An **enum** (enumeration) is a type whose value is exactly **one** of its
+variants. A variant can hold no data (`ZeroDimension`) or named fields
+(`OddDimension { dimension }`). The fields let the error message show the
+invalid value.
+
+Why one enum and not one struct for each error (as `DimensionMismatch` in
+Entry 2)? A RoPE function can fail for several reasons. With one enum, every
+RoPE function has the same error type, and `?` works between them without a
+conversion. `match` on the enum must handle every variant. If we add a
+variant later, the compiler shows every `match` that we must update.
+
+Small independent example:
+
+```rust
+enum Shape { Circle { r: f64 }, Square { side: f64 } }
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Circle { r } => 3.14159 * r * r,
+        Shape::Square { side } => side * side,
+    }
+}
+```
+
+### 4.2 `Display` and `std::error::Error`
+
+`impl fmt::Display for RopeError` gives a human-readable message, so that
+`error.to_string()` and `println!("{error}")` work. The empty
+`impl std::error::Error for RopeError {}` marks the type as an error. Then
+`?` can convert it into `Box<dyn std::error::Error>`. The example program
+uses this: `fn main() -> Result<(), Box<dyn std::error::Error>>`.
+
+Example output (from the test `errors_have_readable_messages`):
+
+```text
+the embedding dimension 7 is odd; RoPE needs an even dimension, because it rotates the dimensions in pairs
+```
+
+### 4.3 `Result<(), E>` and the unit type
+
+```rust
+pub fn validate_dimension(dimension: usize) -> Result<(), RopeError>
+```
+
+A check has no value to return when the input is valid. The type `()`
+("unit") is the empty value. `Ok(())` means "valid". `Err(e)` means "invalid,
+for the reason `e`". The caller cannot ignore the result silently: an unused
+`Result` gives a compiler warning (`#[must_use]`).
+
+### 4.4 The `?` operator
+
+```rust
+pub fn new(dimension: usize, base: f64) -> Result<Self, RopeError> {
+    validate_dimension(dimension)?;
+    validate_base(base)?;
+    Ok(RopeConfig { dimension, base })
+}
+```
+
+`expr?` means: if `expr` is `Err(e)`, return `Err(e)` from this function
+now. If it is `Ok(v)`, continue with the value `v`. The order of the checks
+is the order of the lines. The test `dimension_is_checked_before_base`
+shows this: `RopeConfig::new(3, −1.0)` reports the dimension error.
+
+### 4.5 "Validate one time, then trust the type"
+
+The fields of `RopeConfig` are private. The only way to create a
+`RopeConfig` outside the module is `RopeConfig::new` (or
+`with_default_base`), and it checks the values. Thus:
+
+> Every `RopeConfig` that exists has an even `d ≥ 2` and a finite `b > 1`.
+
+This guarantee lets `inverse_frequencies(&RopeConfig) -> Vec<f64>` return a
+plain `Vec`, not a `Result`. It cannot fail. The type carries the proof of
+validity. This technique is sometimes called "parse, don't validate".
+
+Without private fields, a caller could write
+`RopeConfig { dimension: 7, base: 1.0 }`, and every function would have to
+check again.
+
+### 4.6 Comparisons with NaN
+
+```rust
+if base > 1.0 && base.is_finite() { Ok(()) } else { Err(...) }
+```
+
+`NaN` ("not a number") is a special `f64` value, for example the result of
+`0.0 / 0.0`. **Every comparison with NaN is `false`.** Thus `NaN > 1.0` is
+`false`, and the check rejects NaN without a special case.
+
+Be careful with the negated form. `if base <= 1.0 { error }` does **not**
+reject NaN, because `NaN <= 1.0` is also `false`. We write the condition for
+the **valid** case, so that NaN falls into the `else` branch.
+
+A test cannot use `assert_eq!` for an error that contains NaN, because
+`NaN != NaN`. It uses `matches!` instead:
+
+```rust
+assert!(matches!(validate_base(f64::NAN), Err(RopeError::InvalidBase { .. })));
+```
+
+`..` means "ignore the remaining fields".
+
+### 4.7 `Vec<f64>`: what it is and how it works
+
+`Vec<f64>` is a **growable array** of `f64` values. It has two parts:
+
+- **On the stack** (24 bytes on a 64-bit computer, measured with
+  `std::mem::size_of`): a pointer to the data, the **capacity** (how many
+  elements fit in the allocated memory), and the **length** (how many
+  elements are in use).
+- **On the heap**: one contiguous block of `capacity · 8` bytes.
+
+```text
+stack:  Vec { ptr ──┐, cap: 4, len: 4 }
+                    ▼
+heap:   [ 1.0 | 0.1 | 0.01 | 0.001 ]      4 × 8 = 32 bytes
+```
+
+If `push` adds an element and `len == cap`, the `Vec` allocates a larger
+block (usually double the size), copies the elements, and frees the old
+block. This is called **reallocation**. We avoid it when we know the final
+size (section 4.8).
+
+When the `Vec` goes out of scope, Rust calls its destructor (`drop`). The
+destructor frees the heap block. There is no garbage collector.
+
+Why `Vec<f64>` and not `[f64; N]`? The number of pairs `d/2` is a run-time
+value (from the configuration). An array `[f64; N]` needs `N` at compile
+time.
+
+### 4.8 Iterators: `0..n`, `map` and `collect`
+
+```rust
+(0..config.num_pairs())
+    .map(|j| inverse_frequency_unchecked(j, dimension, base))
+    .collect()
+```
+
+- `0..n` is a `Range<usize>`. It is an **iterator**: a value with a method
+  `next()` that returns `Some(0)`, `Some(1)`, ..., `Some(n − 1)`, then `None`.
+- `map(f)` creates a new iterator. Each call of `next()` takes the next
+  value `j` and returns `f(j)`. `map` itself does no work. Iterators are
+  **lazy**.
+- `collect()` calls `next()` until `None` and puts the values in a
+  collection. The return type of the function (`Vec<f64>`) tells `collect`
+  which collection to build.
+
+**One allocation.** A `Range` knows its exact length, and `map` keeps this
+knowledge. (The iterator reports it through its `size_hint` method.) Thus
+`collect` allocates the final capacity one time. No reallocation occurs.
+
+**How the compiler sees it.** The compiler inlines `next`, `map` and the
+closure. The optimized machine code is the same as a hand-written loop:
+
+```rust
+let mut v = Vec::with_capacity(n);
+for j in 0..n {
+    v.push(inverse_frequency_unchecked(j, dimension, base));
+}
+```
+
+### 4.9 Closures that capture variables
+
+`|j| inverse_frequency_unchecked(j, dimension, base)` is a **closure**: an
+anonymous function. It uses `dimension` and `base` from the surrounding
+function. It **captures** them. We copied `config.dimension()` and
+`config.base()` into local variables first. Then the closure captures two
+small `Copy` values, not the reference `config`.
+
+### 4.10 `as` conversions
+
+```rust
+let exponent = (2 * pair_index) as f64 / dimension as f64;
+```
+
+`as f64` converts an integer to `f64`. Rust never converts number types
+automatically: `2 * pair_index / dimension` would be an **integer** division
+(`2 / 8 = 0` in integers). We convert both numbers first, then divide in
+floating point. The conversion is exact for integers up to `2^53`.
+
+### 4.11 A private helper with `#[inline]`
+
+```rust
+#[inline]
+fn inverse_frequency_unchecked(pair_index: usize, dimension: usize, base: f64) -> f64
+```
+
+The formula is in exactly one place. Both public functions call it. The
+helper is private (no `pub`), because it does not check its input. A public
+caller must go through the checked functions. `#[inline]` suggests to the
+compiler that it copy the function body into the caller. For a two-line
+function this removes the call overhead.
+
+### 4.12 Borrowing the configuration: `&RopeConfig`
+
+```rust
+pub fn inverse_frequencies(config: &RopeConfig) -> Vec<f64>
+```
+
+The function only **reads** the configuration. A shared reference `&` lends
+the value to the function. The caller keeps ownership and can use `config`
+again after the call. `RopeConfig` is `Copy` (16 bytes), so we could also
+pass it by value. We pass a reference because (1) it states the intent
+"read only", and (2) the API stays the same if a later stage adds a field
+that is not `Copy` (for example a `Vec` of scaling factors in Stage 5).
+
+### 4.13 Documentation tests with `?`
+
+```rust
+/// let config = RopeConfig::new(8, 10_000.0)?;
+/// # Ok::<(), rust_rope::utils::validation::RopeError>(())
+```
+
+`cargo test` compiles and runs the examples in `///` comments. A doc test is
+the body of a hidden function. The hidden last line (`#` hides it in the
+documentation) makes this function return `Result`, so `?` works.
+
+## 5. Memory and execution
+
+| Value | Size (measured) | Location | Notes |
+|---|---|---|---|
+| `RopeConfig` | 16 B | stack | `usize` + `f64`. `Copy`. |
+| `RopeError` | 24 B | stack | The compiler stores the variant tag inside the free bits of the `Option<usize>` field. |
+| `Vec<f64>` header | 24 B | stack | pointer, capacity, length |
+| frequency data | `d/2 · 8` B | heap | 32 B for `d = 8`, 512 B for `d = 128` |
+
+**Execution of `inverse_frequencies(&config)`:**
+
+1. The function reads `d` and `b` from the borrowed configuration.
+2. `collect` allocates one heap block of `d/2 · 8` bytes.
+3. For each `j`, the code calculates `2j/d` and one `powf`, and writes the
+   result into the block.
+4. The function **moves** the `Vec` to the caller. A move copies only the
+   24-byte header. The heap data stays where it is.
+5. When the caller's variable goes out of scope, `drop` frees the block.
+
+**Ownership summary:** the configuration is borrowed (`&`). The frequencies
+are owned by the caller. No value is cloned.
+
+## 6. Engineering decisions
+
+1. **The rule `b > 1`, not `b > 0`.** The formula is defined for every
+   `b > 0`. But `b = 1` gives equal speeds, and `b < 1` reverses the order of
+   the speeds. Neither is RoPE. A strict rule detects a configuration
+   mistake early. With this rule, "the frequencies decrease" is true for
+   every valid configuration.
+2. **`d = 0` is invalid.** Zero is even, but it gives zero pairs. Every later
+   function would have to handle the empty case.
+3. **Validation in `utils::validation`.** Several modules use the same
+   checks (Entries 8 and 9 add more). One place gives one rule and one
+   message.
+4. **`RopeConfig` validates in its constructor.** The frequency functions
+   then need no `Result` (section 4.5).
+5. **`inverse_frequency` (single) returns `Result`.** The pair index `j` is
+   a separate input from the caller. It can be out of range.
+6. **`f64`.** This is an educational implementation and a future reference
+   for `f32` code. `f64` keeps the rounding errors far below the effects
+   that we want to study. Stage 6 can compare `f32`.
+7. **`b.powf(−x)` instead of `1.0 / b.powf(x)`.** One rounding instead of
+   two (section 3.10).
+8. **No external error crate** (for example `thiserror`). The standard
+   library is sufficient: one `Display` implementation and one empty
+   `Error` implementation.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `(-x * b.ln()).exp()` | The same mathematics; one `ln` for all pairs | Two operations per value; `powf` is clearer |
+| Repeated multiplication `θ_(j+1) = θⱼ · r` | One `powf` in total | Errors accumulate. Measured: up to `1.6e−15` relative error for `d = 64`, compared with about `1e−16` for `powf` |
+| Methods on `RopeConfig` (`config.inverse_frequencies()`) | Short call syntax | Mixes configuration and calculation; the architecture puts frequencies in `frequencies.rs` |
+| Free functions with `(d, b)` arguments | No struct | Every function must validate again |
+| `[f64; N]` with a const generic `N` | No heap, size checked at compile time | `d` is a run-time configuration value; more complex types |
+| `Box<[f64]>` instead of `Vec<f64>` | 16-byte header, cannot grow by mistake | Less familiar; no practical gain here |
+| `thiserror` crate | Less boilerplate for `Display` | An external dependency for a few lines of code |
+
+## 8. Performance considerations
+
+- `inverse_frequencies` does `d/2` calls of `powf`. A `powf` call costs
+  about 20 to 100 processor cycles. For `d = 128`, this is about 64 calls:
+  less than a few microseconds.
+- The model calculates the list **one time** and reuses it. Thus this cost
+  is negligible compared with attention.
+- Memory: `d/2 · 8` bytes. 512 bytes for `d = 128`. This fits easily in the
+  L1 cache of the processor.
+- Possible optimization (not needed): calculate `ln b` one time and use
+  `exp`. Not worth the loss of clarity.
+
+## 9. Practical example
+
+```rust
+use rust_rope::rope::config::RopeConfig;
+use rust_rope::rope::frequencies::inverse_frequencies;
+use std::f64::consts::TAU; // TAU = 2π
+
+let config = RopeConfig::new(8, 10_000.0)?;
+let theta = inverse_frequencies(&config);
+for (j, &t) in theta.iter().enumerate() {
+    let exponent = (2 * j) as f64 / config.dimension() as f64;
+    println!("j = {j}: 2j/d = {exponent:<4}  θ = {t:<22?}  wavelength 2π/θ = {:.2}", TAU / t);
+}
+for w in theta.windows(2) {
+    println!("θ(j+1)/θ(j) = {:?}", w[1] / w[0]);
+}
+```
+
+Expected output (from `cargo run --example rope_frequencies`):
+
+```text
+j = 0: 2j/d = 0     θ = 1.0                     wavelength 2π/θ = 6.28
+j = 1: 2j/d = 0.25  θ = 0.1                     wavelength 2π/θ = 62.83
+j = 2: 2j/d = 0.5   θ = 0.01                    wavelength 2π/θ = 628.32
+j = 3: 2j/d = 0.75  θ = 0.001                   wavelength 2π/θ = 6283.19
+θ(j+1)/θ(j) = 0.1
+θ(j+1)/θ(j) = 0.09999999999999999
+θ(j+1)/θ(j) = 0.1
+```
+
+An invalid configuration is an error, not a panic:
+
+```rust
+assert!(RopeConfig::new(7, 10_000.0).is_err()); // odd dimension
+assert!(RopeConfig::new(8, 1.0).is_err());      // base not > 1
+```
+
+## 10. What we learned
+
+**Mathematics:**
+
+- `θⱼ = b^(−2j/d)` gives each pair its own rotation speed, from `1` down to
+  about `1/b`.
+- One speed is not sufficient: fast speeds wrap around, slow speeds cannot
+  separate neighbours. Many speeds work together, like the hands of a clock.
+- `2j` is the index of the first dimension of pair `j`. `2j/d = j/(d/2)` is
+  the fraction of the pairs before pair `j`.
+- The division by `d` keeps the exponent in `[0, 1)`, so the speed range
+  does not depend on `d`.
+- For `b > 1`, `b^x` increases with `x`, so `θⱼ` decreases with `j`.
+- The frequencies form a geometric sequence with the ratio `b^(−2/d)`. The
+  wavelength `2π/θⱼ` goes from `6.28` to almost `2π·b` positions.
+- For `d = 8`, `b = 10000`: `θ = [1, 0.1, 0.01, 0.001]`.
+
+**Rust:**
+
+- An `enum` with data is a good error type. `match` must handle every
+  variant.
+- `Display` + `std::error::Error` make an error usable with `?` and
+  `Box<dyn Error>`.
+- `Result<(), E>` for checks. `?` returns early on the first error.
+- Private fields + a checking constructor: "validate one time, then trust
+  the type".
+- Every comparison with NaN is `false`. Write the condition for the valid
+  case.
+- `Vec<f64>` = a 24-byte header on the stack + a heap block. `collect` from
+  an exact-size iterator allocates one time.
+- Iterators are lazy. `map` + `collect` compiles to a plain loop.
+- `as f64` before a division, to avoid integer division.
+
+
+---
+
+# Entry 8 — Position indexing (Stage 3, Component 2)
+
+**Date:** 2026-11-01
+**Stage:** 3 (RoPE fundamentals)
+**Files:** `src/rope/position.rs`, `src/utils/validation.rs`
+(`validate_position`, `MAX_POSITION`), `tests/rope_tests.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `Position` (validated newtype around `usize`), `Position::ZERO` | ✅ Implemented |
+| `validate_position`, `MAX_POSITION = 2^53` | ✅ Implemented |
+| `PositionRange` (configurable start and length, lazy iterator) | ✅ Implemented |
+| `PositionRange::index_of` (position → row index) | ✅ Implemented |
+| Non-consecutive positions (for example, packed sequences) | ❌ Not implemented. Not needed in Stage 3. |
+| Position scaling (interpolation) | ⏳ Planned (Stage 5) |
+
+---
+
+## 1. What did we build?
+
+We built two types for token positions:
+
+- `Position` is one token position `m`. It is a `usize` in a wrapper that
+  guarantees `m ≤ 2^53`.
+- `PositionRange` is a sequence of consecutive positions
+  `start, start + 1, ..., start + L − 1`. The start and the length `L` are
+  configurable. The range produces its positions one at a time, without a
+  heap allocation.
+
+## 2. Why did we build it?
+
+The RoPE angle is `φ(m, j) = m · θⱼ`. Entry 7 gave us `θⱼ`. This entry
+gives us `m`. Entry 9 multiplies them.
+
+A configurable start is necessary in real models. A language model
+generates text one token at a time. Example: the prompt has 1000 tokens
+(positions 0 to 999). The next generated token has position 1000, not 0.
+The model calls `PositionRange::new(1000, 1)` for it. If it used position 0
+again, the new token would get the rotation of the first token, and the
+relative distances would be wrong.
+
+## 3. Mathematical foundation
+
+### 3.1 Token position versus dimension-pair index
+
+RoPE uses two integer indices. They have completely different roles.
+
+| | Token position `m` | Dimension-pair index `j` |
+|---|---|---|
+| What it counts | tokens in the sequence | pairs inside one vector |
+| Range | `0, 1, 2, ...` (only limited by the context length) | `0, 1, ..., d/2 − 1` (fixed by `d`) |
+| What it selects | **how far** a pair rotates (the angle) | **how fast** a pair rotates (the frequency `θⱼ`) |
+| Changes when | we move to another token | we move to another pair of the same token |
+| Rust type | `Position` | `usize` |
+
+**Example.** The sentence "the cat sat" has three tokens. With `d = 8`, each
+token has a vector with 8 numbers, thus 4 pairs:
+
+```text
+            j = 0      j = 1      j = 2      j = 3
+            (dims 0,1) (dims 2,3) (dims 4,5) (dims 6,7)
+m = 0 "the"   0·θ₀       0·θ₁       0·θ₂       0·θ₃
+m = 1 "cat"   1·θ₀       1·θ₁       1·θ₂       1·θ₃
+m = 2 "sat"   2·θ₀       2·θ₁       2·θ₂       2·θ₃
+```
+
+A row is one token (one value of `m`). A column is one pair (one value of
+`j`). Entry 9 calculates this table.
+
+### 3.2 Positions are integers
+
+A token position is a count: "the first token", "the second token", and so
+on. Thus `m` is a non-negative integer: `m ∈ {0, 1, 2, ...}`. The first
+token has `m = 0`, because Rust (and most Transformer code) counts from 0.
+
+The angle formula `m · θⱼ` needs `m` as a real number. Thus we convert `m`
+to `f64`. Section 3.3 shows that this conversion has a limit.
+
+### 3.3 Why the limit is `2^53`
+
+An `f64` value is `± 1.f × 2^e`. The fraction `f` has 52 stored bits. With
+the leading `1`, the **significand** has 53 bits.
+
+- An integer `n` with `n ≤ 2^53` needs at most 53 significant bits. (`2^53`
+  itself is `1 × 2^53`: one significant bit.) Thus `f64` stores it
+  **exactly**.
+- `2^53 + 1` needs 54 significant bits. `f64` cannot store it. The
+  conversion rounds it to `2^53` (round to the nearest even value).
+
+The test `position_limit_is_two_to_the_53` checks both facts:
+
+```rust
+assert_eq!(max as f64, (max + 1) as f64);   // 2^53 and 2^53 + 1: the same f64
+assert_ne!((max - 1) as f64, max as f64);   // 2^53 − 1 and 2^53: different
+```
+
+Above the limit, two different positions would get the **same angle**. The
+model could not separate them. Thus `Position::new` rejects `m > 2^53`.
+
+**In practice** the limit is very far away: `2^53 ≈ 9 × 10^15`. Current
+models use up to about `10^6` or `10^7` positions. But Entry 9 shows that the
+**angle** loses precision much earlier, because the absolute error of
+`m · θ` grows with `m`.
+
+### 3.4 A range of consecutive positions
+
+`PositionRange::new(start, L)` describes the positions:
+
+```text
+start, start + 1, start + 2, ..., start + L − 1
+```
+
+- `L = 0` gives an empty sequence. This is valid.
+- The last position `start + L − 1` must be at most `2^53`.
+- The **row index** of position `m` in the range is `r = m − start`. It is
+  valid when `0 ≤ r < L`. `index_of` calculates it.
+
+Example: `start = 5`, `L = 3` gives positions `5, 6, 7`. Position 6 has row
+index `6 − 5 = 1`. Position 8 is not in the range.
+
+### 3.5 Preview: why the start offset does not change attention
+
+Stage 2 proved: `R(mθ)ᵀ R(nθ) = R((n − m)θ)`. The attention score depends
+only on `n − m`. If we add the same offset `s` to all positions, then
+`(n + s) − (m + s) = n − m`. The scores do not change. Thus the offset is
+not an error. It only must be **the same** for all tokens of one sequence.
+The test `start_offset_table_equals_the_matching_rows_of_a_table_from_zero`
+(Entry 9) checks that a range with an offset gives the same angles as the
+matching rows of a range from 0.
+
+## 4. Rust concepts learned
+
+### 4.1 The newtype pattern
+
+```rust
+pub struct Position(usize);
+```
+
+This is a **tuple struct** with one field. Its field has no name; we access
+it as `self.0`. A struct with one field is called a **newtype**.
+
+Why? `Position` and the pair index `j` are both integers. With plain `usize`
+values, this mistake compiles:
+
+```rust
+fn angle(m: usize, j: usize) -> f64 { /* ... */ }
+angle(j, m); // wrong order: compiles, gives a wrong result
+```
+
+With the newtype, the compiler rejects it:
+
+```rust
+fn angle(m: Position, theta: f64) -> f64 { /* ... */ }
+angle(j, theta); // error[E0308]: mismatched types: expected `Position`, found `usize`
+```
+
+**Cost:** zero. `Position` has the same size as `usize` (8 bytes, measured)
+and the same layout. The wrapper exists only at compile time.
+
+The field is private. Thus code outside `position.rs` cannot write
+`Position(10_000_000_000_000_000)`. It must call `Position::new`, which
+checks the limit.
+
+### 4.2 `derive` for ordering
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+```
+
+- `Copy`: a `Position` is copied, not moved, when you assign it. A copy of
+  8 bytes is as cheap as a move.
+- `Eq`: equality is total. This is correct for integers. (`f64` cannot
+  implement `Eq`, because `NaN != NaN`.)
+- `PartialOrd`, `Ord`: positions have an order, so `a < b` works.
+
+### 4.3 Checked arithmetic
+
+```rust
+let last = start
+    .checked_add(length - 1)
+    .ok_or(RopeError::SequenceTooLong { start, length })?;
+```
+
+`a + b` on integers can **overflow** (the result does not fit in the type).
+In a debug build, Rust panics on overflow. In a release build, the result
+wraps around (for example, `usize::MAX + 1 = 0`). Both are wrong for input
+from a caller.
+
+`checked_add` returns `Option<usize>`: `Some(sum)` or `None` on overflow.
+`ok_or(error)` converts `Option` into `Result`: `Some(v)` becomes `Ok(v)`,
+`None` becomes `Err(error)`. Then `?` returns the error.
+
+Small example:
+
+```rust
+assert_eq!(250u8.checked_add(5), Some(255));
+assert_eq!(250u8.checked_add(6), None);   // 256 does not fit in a u8
+```
+
+`index_of` uses `checked_sub` in the same way. `position − start` is
+`None` if `position < start`. The `?` operator also works on `Option` in a
+function that returns `Option`: it returns `None` early.
+
+### 4.4 `impl Iterator` in the return type
+
+```rust
+pub fn iter(self) -> impl Iterator<Item = Position> {
+    (self.start..self.start + self.length).map(Position)
+}
+```
+
+The exact type of `(a..b).map(Position)` is
+`Map<Range<usize>, fn(usize) -> Position>`. This is long, and it is an
+implementation detail. `impl Iterator<Item = Position>` means: "this
+function returns **some** type that implements `Iterator` with items of
+type `Position`".
+
+- The caller can use all iterator methods (`for`, `map`, `count`,
+  `collect`, ...).
+- The compiler still knows the exact type. It generates direct code. There
+  is no heap allocation and no dynamic dispatch (no `Box<dyn Iterator>`).
+- We can change the implementation later without a change to the public
+  type.
+
+### 4.5 A tuple-struct constructor is a function
+
+`map(Position)` passes the **constructor** `Position` as a function. For a
+tuple struct, `Position` can be used as a function `fn(usize) -> Position`.
+It is the same as `map(|v| Position(v))`, but shorter. (This works only
+inside `position.rs`, because the field is private.)
+
+The test code uses the same idea with a method: `map(Position::value)` is
+`map(|m| m.value())`.
+
+### 4.6 `self` by value on a `Copy` type
+
+`PositionRange` is `Copy` (16 bytes). Its methods take `self`, not `&self`.
+When you call `range.iter()`, Rust **copies** the range into the method.
+The original stays usable:
+
+```rust
+let range = PositionRange::new(10, 5)?;
+assert_eq!(range.iter().count(), 5);
+assert_eq!(range.iter().count(), 5); // still valid: `range` was copied
+```
+
+The returned iterator owns its own copy of `start` and `length`. It does
+not borrow `range`. Thus it has no lifetime connection to `range`.
+
+### 4.7 Lazy generation and `collect`
+
+`iter()` does not create the positions. It creates a small iterator state
+(the current value and the end). Each call of `next()` calculates one
+position. If you need a list, you ask for it explicitly:
+
+```rust
+let values: Vec<usize> = PositionRange::new(5, 3)?.iter().map(|m| m.value()).collect();
+assert_eq!(values, vec![5, 6, 7]);
+```
+
+### 4.8 Conditional compilation in tests
+
+```rust
+#[cfg(target_pointer_width = "64")]
+{ let max = MAX_POSITION as usize; /* ... */ }
+```
+
+`2^53` does not fit in a 32-bit `usize`. The block compiles only on 64-bit
+targets. On a 32-bit target, every `usize` is far below `2^53`, so the
+limit can never be reached there.
+
+`MAX_POSITION` itself is a `u64`, not a `usize`, for the same reason. The
+check converts the position: `position as u64 > MAX_POSITION`. The
+conversion from `usize` to `u64` never loses information.
+
+## 5. Memory and execution
+
+| Value | Size (measured) | Location |
+|---|---|---|
+| `Position` | 8 B | stack / register |
+| `PositionRange` | 16 B | stack / registers |
+| the iterator from `iter()` | about 16 B | stack |
+
+**No heap allocation.** A range of one million positions uses 16 bytes. A
+`Vec<Position>` of one million positions would use 8 MB on the heap.
+
+**Execution of `PositionRange::new(start, L)`:**
+
+1. Check `start ≤ 2^53`.
+2. If `L > 0`: calculate `last = start + L − 1` with `checked_add`. Check
+   `last ≤ 2^53`.
+3. Return the 16-byte struct by value.
+
+**Execution of `for m in range.iter()`:** the loop keeps one counter. Each
+step increments it and wraps it in `Position`. After inlining, this is the
+same machine code as `for v in start..start + L`.
+
+**Ownership:** all types are `Copy`. Nothing is borrowed, nothing is moved
+in a way that invalidates the original.
+
+## 6. Engineering decisions
+
+1. **A newtype for `Position`, but not for the pair index.** One newtype is
+   sufficient to make the two indices incompatible. A second newtype
+   (`PairIndex`) would add conversions everywhere with no extra safety for
+   the current API.
+2. **`usize` inside `Position`.** Positions are used as counts and as
+   offsets for row indices. `usize` is the Rust type for indices.
+3. **The limit is `2^53`.** It is the exact boundary for a lossless
+   conversion to `f64`. It is not a model limit (a model has its own
+   maximum context length; that belongs to a later configuration).
+4. **An empty range is valid.** A sequence with zero tokens is a correct
+   edge case (for example, an empty batch). Rejecting it would force callers
+   to add special cases.
+5. **A lazy range, not a `Vec<Position>`.** Positions are consecutive, so
+   two numbers describe all of them.
+6. **`index_of` returns `Option`.** "The position is not in this range" is a
+   normal answer, not an error.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| Plain `usize` for positions | Simplest | The compiler cannot detect swapped indices; no limit check |
+| `Position(u64)` | Same size on all targets | Conversions to `usize` for indexing |
+| `f64` positions | No conversion | Non-integer positions are possible by mistake (Stage 5 interpolation will need scaled positions deliberately) |
+| `Vec<Position>` from a function | Supports arbitrary positions | Allocates `8·L` bytes; consecutive positions do not need it |
+| Implement `Iterator` for a custom struct | Full control, nameable type | More code than `impl Iterator` |
+| `std::ops::Range<Position>` | Standard type | `Range<T>` iterates only when `T` implements the unstable `Step` trait |
+
+## 8. Performance considerations
+
+- `Position::new`: one comparison. `PositionRange::new`: two comparisons
+  and one checked addition. O(1).
+- `iter()`: O(1) to create, O(1) per step, no allocation.
+- `index_of`: one subtraction and one comparison. O(1).
+- The newtype has no run-time cost.
+
+## 9. Practical example
+
+```rust
+use rust_rope::rope::position::{Position, PositionRange};
+
+let m = Position::new(3)?;
+println!("{} {}", m.value(), m.as_f64());                 // 3 3
+
+let prompt = PositionRange::from_zero(4)?;
+let next = PositionRange::new(prompt.len(), 1)?;           // continue after the prompt
+let a: Vec<usize> = prompt.iter().map(Position::value).collect();
+let b: Vec<usize> = next.iter().map(Position::value).collect();
+println!("{a:?} {b:?}");                                   // [0, 1, 2, 3] [4]
+
+println!("{:?}", PositionRange::new(5, 3)?.index_of(Position::new(6)?)); // Some(1)
+println!("{}", Position::new(usize::MAX).unwrap_err());
+```
+
+Expected output (on a 64-bit computer):
+
+```text
+3 3
+[0, 1, 2, 3] [4]
+Some(1)
+the position 18446744073709551615 is larger than the maximum position 9007199254740992 (2^53)
+```
+
+## 10. What we learned
+
+**Mathematics:**
+
+- The token position `m` selects **how far** a pair rotates. The pair index
+  `j` selects **how fast** it rotates. They are different indices.
+- Positions are non-negative integers. The angle needs them as `f64`.
+- `f64` stores every integer up to `2^53` exactly. Above `2^53`, neighbouring
+  integers can convert to the same `f64`.
+- A constant offset on all positions does not change the relative distances,
+  so it does not change the attention scores.
+
+**Rust:**
+
+- A newtype (`struct Position(usize)`) makes two integer roles incompatible,
+  at zero run-time cost.
+- A private field + a checking constructor guarantees an invariant.
+- `checked_add` / `checked_sub` return `Option` instead of overflowing.
+  `ok_or` converts `Option` to `Result`. `?` works on both.
+- `impl Iterator<Item = T>` returns an iterator without naming its type and
+  without allocation.
+- A tuple-struct constructor can be used as a function (`map(Position)`).
+- Methods with `self` on a `Copy` type copy the value; the original stays
+  usable.
+- `#[cfg(...)]` compiles code only for some targets.
+
+
+---
+
+# Entry 9 — Positional angles and the angle table (Stage 3, Component 3)
+
+**Date:** 2026-11-01
+**Stage:** 3 (RoPE fundamentals)
+**Files:** `src/rope/frequencies.rs` (the angle part),
+`src/utils/validation.rs` (`validate_inverse_frequency`,
+`validate_inverse_frequencies`), `tests/rope_tests.rs`,
+`tests/numerical_tests.rs`, `examples/rope_frequencies.rs`
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| `angle(m, θ)` = `m · θ`, with validation of `θ` | ✅ Implemented |
+| `AngleTable` (row-major `L × P` table of `φ(m, j)`) | ✅ Implemented |
+| Lookup: `row(m)`, `get(m, j)`, `as_slice()` | ✅ Implemented |
+| Test: the angles define rotation matrices with the RoPE properties | ✅ Implemented |
+| `cos φ`, `sin φ` cache (the "RoPE cache") | ⏳ Planned (Stage 4) |
+| Rotation of embedding vectors | ⏳ Planned (Stage 4) |
+
+---
+
+## 1. What did we build?
+
+We built the calculation of the **positional angles**:
+
+```text
+φ(m, j) = m · θⱼ
+```
+
+- `angle(m, θ)` calculates one angle.
+- `AngleTable::new(positions, &θ)` calculates the angles for a range of
+  positions and all pairs. It stores them in one flat `Vec<f64>`.
+
+## 2. Why did we build it?
+
+The angle is the last value before the rotation. Stage 4 will calculate
+`cos φ(m, j)` and `sin φ(m, j)` and rotate pair `j` of the token at position
+`m`. Each angle completely defines one 2 × 2 rotation matrix (section 3.6).
+Thus the angle table **is** the complete position information of RoPE.
+
+## 3. Mathematical foundation
+
+### 3.1 The equation and its variables
+
+```text
+φ(m, j) = m · θⱼ
+```
+
+| Symbol | Meaning | Unit |
+|---|---|---|
+| `m` | token position (Entry 8) | positions |
+| `j` | dimension-pair index (Entry 7) | — |
+| `θⱼ` | inverse frequency of pair `j` (Entry 7) | radians per position |
+| `φ(m, j)` | rotation angle of pair `j` of the token at position `m` | radians |
+
+The units explain the formula: (radians per position) × (positions) =
+radians. `θⱼ` is a **speed**, `m` is a **distance**, `φ` is the **total
+angle**.
+
+### 3.2 Derivation: constant speed
+
+RoPE wants each step of one position to add the same rotation `θⱼ` to pair
+`j`. Then:
+
+```text
+φ(0, j) = 0                      (start: no rotation)
+φ(1, j) = φ(0, j) + θⱼ = θⱼ
+φ(2, j) = φ(1, j) + θⱼ = 2θⱼ
+...
+φ(m, j) = m · θⱼ                 (m steps of θⱼ)
+```
+
+A constant step gives a **linear** function of `m`. The test
+`angles_increase_linearly_with_position` checks
+`φ(m + 1, j) − φ(m, j) = θⱼ` for `m = 0..63` and `d = 8, 64, 128`.
+
+Why must the step be constant? Only then does the rotation between two
+positions depend only on their **distance**:
+`φ(n, j) − φ(m, j) = (n − m)·θⱼ`. This is the relative-position property
+(section 3.7).
+
+### 3.3 The angle table for `d = 8`, `b = 10000`, `m = 0..4`
+
+The frequencies (Entry 7) are `θ = [1, 0.1, 0.01, 0.001]`. Each cell is
+`m · θⱼ`:
+
+| `m` | `j = 0` (`θ₀ = 1`) | `j = 1` (`θ₁ = 0.1`) | `j = 2` (`θ₂ = 0.01`) | `j = 3` (`θ₃ = 0.001`) |
+|---|---|---|---|---|
+| 0 | 0·1 = 0 | 0·0.1 = 0 | 0·0.01 = 0 | 0·0.001 = 0 |
+| 1 | 1·1 = 1 | 1·0.1 = 0.1 | 1·0.01 = 0.01 | 1·0.001 = 0.001 |
+| 2 | 2·1 = 2 | 2·0.1 = 0.2 | 2·0.01 = 0.02 | 2·0.001 = 0.002 |
+| 3 | 3·1 = 3 | 3·0.1 = 0.3 | 3·0.01 = 0.03 | 3·0.001 = 0.003 |
+| 4 | 4·1 = 4 | 4·0.1 = 0.4 | 4·0.01 = 0.04 | 4·0.001 = 0.004 |
+
+All values are in radians. For a feeling of size: `1 rad ≈ 57.3°`. Thus
+pair 0 at `m = 4` has rotated `4 rad ≈ 229°`, and pair 3 at `m = 4` has
+rotated only `0.004 rad ≈ 0.23°`.
+
+**Read the table by column (one pair):** the values grow linearly, with the
+step `θⱼ`. **Read the table by row (one token):** the values fall by the
+factor 10 from pair to pair (the geometric sequence of Entry 7).
+
+### 3.4 Why position zero gives zero rotation
+
+`φ(0, j) = 0 · θⱼ = 0` for every pair. The rotation matrix for the angle 0 is
+the identity:
+
+```text
+R(0) = [ cos 0   −sin 0 ] = [ 1  0 ]
+       [ sin 0    cos 0 ]   [ 0  1 ]
+```
+
+Thus RoPE does **not change** the vectors of the first token. This is
+correct: position 0 is the reference point. RoPE measures the other
+positions relative to it. In `f64`, `0 · θ` is exactly `0` for every finite
+`θ`, so the test `position_zero_gives_zero_angles` uses exact equality.
+
+(Detail: the program prints `R(0, 0) = [[1, -0], [0, 1]]`. The element
+`−sin 0` is `−0.0`, the negative zero of IEEE 754. It is equal to `0.0`:
+`-0.0 == 0.0` is `true`.)
+
+### 3.5 Why the same position gives different angles for different pairs
+
+At a fixed position `m ≠ 0`, the angles are `m·θ₀, m·θ₁, ..., m·θ_(P−1)`.
+Entry 7 proved that `θ₀ > θ₁ > ... > θ_(P−1) > 0` for `b > 1`. Multiply by
+`m > 0`: the order does not change. Thus:
+
+```text
+φ(m, 0) > φ(m, 1) > ... > φ(m, P − 1) > 0      for every m ≥ 1
+```
+
+All angles of one token are **different**. Each pair carries a different
+"view" of the same position: pair 0 changes quickly, pair 3 changes slowly.
+This is the clock idea of Entry 7, section 3.3. (Test:
+`different_pairs_give_different_angles_at_nonzero_positions`.)
+
+### 3.6 The connection to the rotation matrix
+
+Entry 5 defined the rotation matrix for an angle `α`:
+
+```text
+R(α) = [ cos α   −sin α ]
+       [ sin α    cos α ]
+```
+
+RoPE uses the angle `α = φ(m, j) = m · θⱼ`. We write `R(m, j)`:
+
+```text
+R(m, j) = [ cos(m·θⱼ)   −sin(m·θⱼ) ]
+          [ sin(m·θⱼ)    cos(m·θⱼ) ]
+```
+
+Three inputs determine the matrix, through two steps:
+
+```text
+(d, b, j) ──Entry 7──► θⱼ ──┐
+                            ├──Entry 9──► φ = m·θⱼ ──Entry 5──► R(m, j)
+       m ──Entry 8──────────┘
+```
+
+- **The frequency step** (`d`, `b`, `j` → `θⱼ`) decides the **speed** of the
+  rotation of pair `j`.
+- **The position step** (`m` → `m·θⱼ`) decides **how far** the pair has
+  rotated at this token.
+
+**Numerical example: `m = 1`, `d = 8`** (from `cargo run --example
+rope_frequencies`):
+
+```text
+j = 0: φ = 1      R = [[0.540302, -0.841471], [0.841471, 0.540302]]
+j = 1: φ = 0.1    R = [[0.995004, -0.099833], [0.099833, 0.995004]]
+j = 2: φ = 0.01   R = [[0.999950, -0.010000], [0.010000, 0.999950]]
+j = 3: φ = 0.001  R = [[1.000000, -0.001000], [0.001000, 1.000000]]
+```
+
+For small angles, `cos φ ≈ 1 − φ²/2` and `sin φ ≈ φ` (the first terms of the
+power series, Entry 6). Thus the matrices for the slow pairs are close to
+the identity. Check `j = 1`: `1 − 0.01/2 = 0.995` and `sin 0.1 ≈ 0.1`.
+
+**The full vector (planned for Stage 4).** A vector with `d = 8` has 4
+pairs. RoPE rotates each pair with its own matrix. As one `8 × 8` matrix,
+this is **block-diagonal** (all other elements are 0):
+
+```text
+R_m = diag( R(m, 0), R(m, 1), R(m, 2), R(m, 3) )
+```
+
+This stage does not implement it. It only calculates the angles.
+
+### 3.7 Properties that follow from the linear angle
+
+These properties follow from Entry 5 (`R(α)R(β) = R(α + β)`,
+`R(α)ᵀ = R(−α)`) and `φ(m, j) = m·θⱼ`:
+
+```text
+R(0, j)              = I                        (position 0: no rotation)
+R(m, j)              = R(1, j)^m                (m steps of the same rotation)
+R(m, j)ᵀ · R(n, j)   = R(n − m, j)              (only the distance counts)
+```
+
+Proof of the third line: `R(mθ)ᵀ R(nθ) = R(−mθ) R(nθ) = R((n − m)θ)`.
+
+The test `angle_table_defines_rope_rotation_matrices` checks all three
+lines with matrices built from the `AngleTable`. The third line is the
+reason for the RoPE design: the attention score
+`(R(m, j)·q)ᵀ (R(n, j)·k) = qᵀ R(n − m, j) k` depends only on `n − m`.
+
+### 3.8 Numerical precision
+
+**Rounding of the product.** `m · θ` is one multiplication. IEEE 754
+rounds it correctly: the relative error is at most `ε/2 ≈ 1.1e−16`. But
+the input `θ` is already rounded. Example from the program:
+
+```text
+full f64 value of φ(3, 1) = 3 · 0.1: 0.30000000000000004
+```
+
+`0.1` is stored as `0.1000000000000000055511151231257827...`. Three times
+this value is slightly more than `0.3`, and the nearest `f64` is
+`0.30000000000000004`. This is one `f64` step (`5.6e−17`) above the `f64`
+value that `0.3` gives. The tests use `approx_eq` with `1e−12`, which
+accepts it.
+
+**The absolute error grows with `m`.** The relative error of `m · θ` stays
+about `1e−16`. Thus the **absolute** error is about `|m·θ| · 1e−16`. For
+`m = 10^6` and `θ = 1`, this is about `1e−10` radian. `sin` and `cos` then
+reduce the angle modulo `2π`, but they cannot remove the error that is
+already in the input (Entry 4, section 3.8).
+
+**`f32` is much worse.** We measured `θ₁ = 10000^(−2/64)` and `m · θ₁` in
+both types:
+
+| `m` | `f64` angle | `f32` angle | absolute difference |
+|---|---|---|---|
+| 1 000 | 749.894209332 | 749.894226074 | 1.7e−5 |
+| 100 000 | 74 989.420933246 | 74 989.421875000 | 9.4e−4 |
+| 1 000 000 | 749 894.209332456 | 749 894.187500000 | 2.2e−2 |
+
+At one million positions, the `f32` angle is wrong by `0.022` radian
+(about `1.25°`). This is one reason that long-context implementations
+calculate the angles in `f32` with care, or in higher precision. Stage 6
+studies this.
+
+**We do not reduce the angle modulo `2π`.** `φ mod 2π` would give a value
+in `[0, 2π)`. But the reduction itself needs `2π` as an `f64`, which is
+rounded. `sin` and `cos` in the standard library do a more accurate
+reduction internally. Thus we keep the raw product.
+
+### 3.9 Where a Transformer uses this
+
+The angles depend only on the positions and the frequencies, not on the
+input text. Thus implementations calculate the table **one time** for the
+maximum context length and reuse it for every layer and every head. Usually
+they store `cos φ` and `sin φ` directly (the "RoPE cache"). Stage 4 will
+build this cache from the `AngleTable`.
+
+## 4. Rust concepts learned
+
+### 4.1 A flat `Vec` with row-major indexing
+
+```rust
+pub struct AngleTable {
+    positions: PositionRange,
+    num_pairs: usize,
+    angles: Vec<f64>,       // angles[r * num_pairs + j]
+}
+```
+
+A 2-D table can be stored as one 1-D `Vec`. **Row-major** order stores row
+0, then row 1, and so on. The element at row `r` and column `j` has the
+index `r · P + j`.
+
+```text
+P = 2, rows m = 2, 3, 4, θ = [1, 0.5]:
+
+index:   0     1     2     3     4     5
+value: [2.0,  1.0,  3.0,  1.5,  4.0,  2.0]
+        └ m=2 ┘     └ m=3 ┘     └ m=4 ┘
+```
+
+(Test: `table_layout_is_row_major`.)
+
+Why not `Vec<Vec<f64>>`? A `Vec<Vec<f64>>` has one heap allocation for
+**each row**, plus one for the outer `Vec`. The rows can be anywhere in
+memory. One flat `Vec` is one allocation, and the processor reads it
+sequentially. This is faster (better cache use) and simpler to free.
+
+Why row-major and not column-major? Stage 4 rotates **one token** at a time.
+It needs all pairs of one position: one row. In row-major order, a row is a
+contiguous slice.
+
+### 4.2 `Vec::with_capacity` and `push`
+
+```rust
+let mut angles = Vec::with_capacity(num_elements);
+for position in positions.iter() {
+    for &theta in inverse_frequencies {
+        angles.push(angle_unchecked(position, theta));
+    }
+}
+```
+
+`Vec::with_capacity(n)` allocates space for `n` elements but sets the
+length to 0. `push` writes one element and increments the length. Because
+the capacity is already correct, no `push` reallocates. The table has
+**exactly one** heap allocation.
+
+Small example:
+
+```rust
+let mut v: Vec<f64> = Vec::with_capacity(3);
+assert_eq!((v.len(), v.capacity() >= 3), (0, true));
+v.push(1.0); v.push(2.0); v.push(3.0);   // no reallocation
+assert_eq!(v.len(), 3);
+```
+
+### 4.3 Borrowed input: `&[f64]`
+
+```rust
+pub fn new(positions: PositionRange, inverse_frequencies: &[f64]) -> Result<Self, RopeError>
+```
+
+`&[f64]` is a **slice**: a borrowed view of a sequence of `f64` values. It
+is a pointer and a length (16 bytes). The caller can pass a `&Vec<f64>`, an
+array, or a part of a `Vec`. Rust converts `&Vec<f64>` to `&[f64]`
+automatically (deref coercion).
+
+The function **borrows** the frequencies. It reads them, and the caller
+keeps ownership. The caller can use the same frequencies for many tables.
+Without the borrow, the function would take ownership, and the caller would
+have to clone the `Vec` for each table.
+
+### 4.4 `for &theta in slice`
+
+`for x in slice` gives references `&f64`. The pattern `&theta` takes the
+value out of the reference. `f64` is `Copy`, so this copies 8 bytes. Then
+`theta` is a plain `f64`, and `m * theta` needs no `*theta`.
+
+### 4.5 `enumerate()`
+
+`validate_inverse_frequencies` uses `enumerate()` to know the index of an
+invalid value:
+
+```rust
+for (j, &value) in values.iter().enumerate() {
+    // j = 0, 1, 2, ...; value = values[j]
+}
+```
+
+`enumerate()` wraps an iterator. Each item becomes a pair `(index, item)`.
+The index starts at 0 and has the type `usize`. It is cheaper and safer than
+a manual counter: you cannot forget to increment it.
+
+Small example:
+
+```rust
+let names = ["a", "b", "c"];
+let v: Vec<(usize, &str)> = names.iter().copied().enumerate().collect();
+assert_eq!(v, [(0, "a"), (1, "b"), (2, "c")]);
+```
+
+### 4.6 Returning a slice: `row(&self) -> Option<&[f64]>`
+
+```rust
+pub fn row(&self, position: Position) -> Option<&[f64]> {
+    let r = self.positions.index_of(position)?;
+    let start = r * self.num_pairs;
+    Some(&self.angles[start..start + self.num_pairs])
+}
+```
+
+- `&self.angles[a..b]` is a slice of the `Vec`: elements `a` to `b − 1`. It
+  points into the existing heap block. **It copies nothing.**
+- The returned slice borrows the table. The full signature is
+  `fn row<'a>(&'a self, position: Position) -> Option<&'a [f64]>`. The
+  compiler adds the **lifetime** `'a` automatically (lifetime elision): an
+  output reference borrows from `self`. While the slice exists, nobody can
+  change or drop the table. The borrow checker enforces this at compile
+  time.
+- `?` on the `Option` from `index_of` returns `None` early when the position
+  is not in the table.
+
+### 4.7 `slice.get(j).copied()`
+
+```rust
+self.row(position)?.get(pair_index).copied()
+```
+
+`slice[j]` panics if `j` is out of range. `slice.get(j)` returns
+`Option<&f64>` instead: `None` if `j` is out of range. `.copied()` turns
+`Option<&f64>` into `Option<f64>`. Thus `get` never panics.
+
+### 4.8 `checked_mul` and `debug_assert_eq!`
+
+`L · P` can overflow for very large inputs. `checked_mul` detects this
+before the allocation and returns `RopeError::TableTooLarge`. The test
+`table_too_large_is_an_error` uses `L = 2^53` and `P = 2^11`:
+`2^64` does not fit in a 64-bit `usize`.
+
+`debug_assert_eq!(angles.len(), num_elements)` checks an **internal**
+invariant. It runs only in debug builds (and tests). If it fails, the
+library has a bug. This is the correct use of a panic (CLAUDE.md,
+section 6).
+
+## 5. Memory and execution
+
+| Value | Size | Location |
+|---|---|---|
+| `AngleTable` struct | 48 B (measured): range 16 + `num_pairs` 8 + `Vec` header 24 | stack |
+| angle data | `L · P · 8` B | heap, one block |
+| the input frequencies | not copied | borrowed from the caller |
+
+Examples of the heap size:
+
+| `L` (positions) | `d` | `P` | heap |
+|---|---|---|---|
+| 5 | 8 | 4 | 160 B |
+| 4096 | 128 | 64 | 2 MiB |
+| 131 072 | 128 | 64 | 64 MiB |
+
+**Execution of `AngleTable::new(range, &theta)`:**
+
+1. Check the frequencies (one pass, `P` comparisons).
+2. Calculate `L · P` with `checked_mul`.
+3. Allocate one block of `L · P · 8` bytes.
+4. Two nested loops: for each position `m`, for each `θⱼ`, write `m·θⱼ`.
+   The writes are sequential in memory.
+5. Move the `Vec` into the struct, and move the struct to the caller (the
+   `Ok(...)` result). The data does not move; only the 48-byte struct does.
+
+**How we avoid unnecessary allocations in Stage 3:**
+
+- The positions are never stored as a list (`PositionRange` is lazy).
+- The frequencies are borrowed, not cloned.
+- The table allocates exactly one block with the final size.
+- `row` and `as_slice` return borrowed slices, not copies.
+
+## 6. Engineering decisions
+
+1. **Angles in `frequencies.rs`.** The task allowed `frequencies.rs` or a
+   new module. The angle is one multiplication of a frequency by a
+   position. A separate module would add a file for about 100 lines, and
+   the fixed architecture table in CLAUDE.md has no "angles" module. The
+   module comment of `position.rs` from Stage 1 said "convert positions into
+   angles". We kept positions in `position.rs` and put the angles next to
+   the frequencies, because the angle needs both.
+2. **The table takes `&[f64]`, not `&RopeConfig`.** The table works with
+   any valid list of frequencies. Thus it does not depend on how the
+   frequencies were calculated. (Stage 5 will scale the frequencies; the
+   table will accept the scaled list without a change.)
+3. **The table validates the frequencies.** A slice is not a validated type
+   (unlike `RopeConfig`). Thus `AngleTable::new` and `angle` check it.
+4. **The table stores the `PositionRange`.** Then `row(m)` takes a real
+   position `m`, not a row index. This avoids the off-by-start mistake when
+   `start ≠ 0`.
+5. **`Option` for lookups, `Result` for construction.** "Position not in the
+   table" is a normal answer. Invalid frequencies are an input error.
+6. **No sine or cosine in this stage.** The task restricts Stage 3 to
+   angles.
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage |
+|---|---|---|
+| `Vec<Vec<f64>>` | Natural `table[r][j]` syntax | `L + 1` allocations, scattered memory |
+| Column-major layout | One pair over all positions is contiguous | Stage 4 needs one position over all pairs |
+| No table: calculate `m·θⱼ` when needed | No memory | Stage 4 would recalculate for each layer and head |
+| A cache of `cos φ` and `sin φ` instead of `φ` | Saves the trigonometry in Stage 4 | Hides the angle, which this stage studies; planned for Stage 4 |
+| `iter().flat_map(...)` + `collect` | One expression | Harder to read; `flat_map` does not know the exact length, so `collect` can reallocate |
+| `f32` angles | Half the memory | Large angle errors at large `m` (section 3.8) |
+| The `ndarray` crate | General N-D arrays | External dependency for one 2-D table |
+
+## 8. Performance considerations
+
+- `AngleTable::new`: `L · P` multiplications, `O(L · P)` time, one
+  allocation. For `L = 4096`, `d = 128`: 262 144 multiplications, which take
+  well below one millisecond.
+- Memory: `L · P · 8` bytes. This is the main cost. A model with a context of
+  131 072 tokens and `d = 128` needs 64 MiB for the angles in `f64`. A
+  `cos`/`sin` cache needs twice that. This is a reason why some
+  implementations calculate the values on the fly or in `f32`.
+- `row` and `get`: `O(1)`. No copy.
+- The inner loop is simple and sequential. The compiler can vectorize it
+  (SIMD, Stage 6).
+
+## 9. Practical example
+
+```rust
+use rust_rope::math::matrix::Matrix2;
+use rust_rope::rope::config::RopeConfig;
+use rust_rope::rope::frequencies::{inverse_frequencies, AngleTable};
+use rust_rope::rope::position::{Position, PositionRange};
+
+let theta = inverse_frequencies(&RopeConfig::new(8, 10_000.0)?);
+let table = AngleTable::new(PositionRange::from_zero(5)?, &theta)?;
+
+for m in table.positions().iter() {
+    let row = table.row(m).expect("the table contains its own positions");
+    print!("m = {}  ", m.value());
+    for phi in row { print!("{phi:<8.3}"); }
+    println!();
+}
+println!("{:?}", table.get(Position::new(3)?, 1));
+
+let phi = table.get(Position::new(1)?, 1).unwrap();
+let [[a, b], [c, e]] = Matrix2::rotation(phi).rows();
+println!("φ = {phi}  R = [[{a:.6}, {b:.6}], [{c:.6}, {e:.6}]]");
+
+let later = AngleTable::new(PositionRange::new(1000, 3)?, &theta)?;
+for m in later.positions().iter() {
+    println!("m = {}: φ = {:?}", m.value(), later.get(m, 3).unwrap());
+}
+```
+
+Expected output (from `cargo run --example rope_frequencies`):
+
+```text
+m = 0  0.000   0.000   0.000   0.000
+m = 1  1.000   0.100   0.010   0.001
+m = 2  2.000   0.200   0.020   0.002
+m = 3  3.000   0.300   0.030   0.003
+m = 4  4.000   0.400   0.040   0.004
+Some(0.30000000000000004)
+φ = 0.1  R = [[0.995004, -0.099833], [0.099833, 0.995004]]
+m = 1000: φ = 1.0
+m = 1001: φ = 1.0010000000000001
+m = 1002: φ = 1.002
+```
+
+## 10. What we learned
+
+**Mathematics:**
+
+- `φ(m, j) = m · θⱼ`: speed (radians per position) × distance (positions)
+  = angle (radians).
+- A constant step per position gives a linear angle. Only a linear angle
+  makes the rotation between two tokens depend only on their distance.
+- Position 0 gives the angle 0 and the identity matrix: the first token is
+  not changed.
+- At a fixed position `m ≥ 1`, the angles of the pairs are all different
+  and decrease with `j`.
+- The angle defines the rotation matrix `R(m, j) = R(m·θⱼ)`. The frequency
+  step decides the speed; the position step decides how far.
+- `R(m, j)ᵀ R(n, j) = R(n − m, j)`: the foundation of relative position.
+- The absolute error of `m·θ` grows with `m`. `f32` loses about `0.02`
+  radian at one million positions.
+
+**Rust:**
+
+- A 2-D table as one flat row-major `Vec`: one allocation, contiguous rows.
+- `Vec::with_capacity` + `push` avoids reallocation.
+- `&[f64]` borrows a sequence without copying it.
+- `enumerate()` gives `(index, item)` pairs.
+- A method can return a slice that borrows `self`. Lifetime elision connects
+  the output lifetime to `&self`.
+- `get(j).copied()` is a lookup that cannot panic.
+- `checked_mul` prevents an overflow in a size calculation.
+  `debug_assert!` checks internal invariants.
+
+---
+
+## Roadmap status after Entry 9
+
+Stage 3 is complete (review pending). The roadmap table after Entry 6 shows
+the state at that time. This table shows the current state.
+
+| Stage | Status |
+|---|---|
+| 1 Project foundation | ✅ Done (Entry 1) |
+| 2 Mathematical foundations | ✅ Done (Entries 2–6) |
+| 3 RoPE fundamentals: frequencies, positions, angles | ✅ Done (Entries 7–9) |
+| 4 RoPE implementation (sine/cosine cache, pair rotation, layouts) | ⏳ Planned (next, after review) |
+| 5 Advanced RoPE | ⏳ Planned |
+| 6 Performance engineering | ⏳ Planned |
+| 7 Validation and experimentation | ⏳ Planned |
+
+**Scope note.** The README listed "Applying rotations to embedding
+dimensions" under Stage 3. The Stage 3 task excluded it. It moves to
+Stage 4.

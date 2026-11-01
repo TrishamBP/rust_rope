@@ -5,12 +5,15 @@
 //!
 //! ## Status
 //!
-//! Stage 2 (mathematical foundations) is complete.
+//! Stage 3 (RoPE fundamentals: frequencies, positions, angles) is complete.
 //!
 //! - Implemented: [`math`] (vectors, 2 × 2 matrices, rotations, complex
 //!   numbers, Euler's formula, trigonometry, float comparison).
-//! - Planned: [`rope`] (Stages 3–5) and [`utils`] (Stage 3). These modules
-//!   are empty. Each module comment describes its planned responsibility.
+//! - Implemented: [`rope::config`], [`rope::frequencies`] (inverse
+//!   frequencies and positional angles), [`rope::position`], and
+//!   [`utils::validation`].
+//! - Planned: [`rope::rotations`] and [`rope::embeddings`] (Stage 4),
+//!   [`rope::scaling`] (Stage 5). These modules are empty.
 //!
 //! ## Module layout
 //!

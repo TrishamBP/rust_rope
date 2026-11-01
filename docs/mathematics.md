@@ -4,8 +4,9 @@ This document collects the mathematics of the project in one place. It is a
 compact reference. The full explanations, with Rust details and numerical
 examples, are in `explain.md` (the entry numbers are given below).
 
-> **Status:** Stage 2 is complete. Sections 2–7 are **implemented** in
-> `src/math/`. Sections 8–11 are **planned**.
+> **Status:** Stage 3 is complete. Sections 2–7 are **implemented** in
+> `src/math/`. Section 8 (frequencies, positions and angles) is
+> **implemented** in `src/rope/`. Sections 9–11 are **planned**.
 
 ---
 
@@ -41,6 +42,9 @@ We define each symbol before we use it.
 | `m`, `n` | Token positions in the sequence (0, 1, 2, ...). |
 | `b` | The frequency base. The RoFormer paper uses `b = 10000`. |
 | `θⱼ` | The rotation frequency of pair `j` (radians per position). |
+| `P` | The number of pairs, `d/2`. (Added in Stage 3.) |
+| `φ(m, j)` | The rotation angle of pair `j` at position `m`: `m·θⱼ`. (Added in Stage 3.) |
+| `λⱼ` | The wavelength of pair `j`: `2π/θⱼ` positions. (Added in Stage 3.) |
 | `q`, `k` | A query vector and a key vector. |
 
 **Notation change.** In Stage 1, this document used `i` for the pair
@@ -249,7 +253,7 @@ This is exactly `R(θ)·[x, y]`. Multiplication by `c + di` equals the matrix
 
 ---
 
-## 8. RoPE frequencies — planned (Stage 3)
+## 8. RoPE frequencies, positions and angles — implemented (Stage 3, Entries 7–9)
 
 ```text
 θⱼ = b^(−2j/d),      j = 0, 1, ..., d/2 − 1
@@ -258,7 +262,134 @@ This is exactly `R(θ)·[x, y]`. Multiplication by `c + di` equals the matrix
 Planned topics: why the frequencies form a geometric sequence, and the
 wavelength of each pair, `λⱼ = 2π / θⱼ`.
 
-## 9. The relative-position property — planned (Stage 3)
+> **Status update (2026-11-01):** implemented in Stage 3
+> (`src/rope/frequencies.rs`, `src/rope/position.rs`, explain.md Entries
+> 7–9). The original planned text above is kept unchanged. The complete
+> derivation follows.
+
+### 8.1 Variables
+
+| Symbol | Meaning |
+|---|---|
+| `d` | The rotary embedding dimension. Even, `d ≥ 2`. |
+| `P = d/2` | The number of dimension pairs. |
+| `j` | The pair index, `0 ≤ j < P`. Pair `j` holds dimensions `2j` and `2j + 1`. (The task text and some papers write `i`.) |
+| `b` | The frequency base, finite, `b > 1`. Default `10000`. |
+| `θⱼ` | The inverse frequency of pair `j`: radians per position. |
+| `λⱼ` | The wavelength of pair `j`: positions per full turn. |
+
+### 8.2 The formula
+
+```text
+θⱼ = 1 / b^(2j/d) = b^(−2j/d),        j = 0, 1, ..., d/2 − 1
+```
+
+### 8.3 Why different frequencies
+
+One speed is not sufficient. A fast speed (`θ = 1`) wraps around after
+`2π ≈ 6.28` positions: `44 mod 2π ≈ 0.018`, so position 44 looks like
+position 0. A slow speed (`θ = 10⁻⁴`) does not wrap around for 62 832
+positions, but neighbouring positions differ by only `10⁻⁴` radian. RoPE uses
+`d/2` speeds from fast to slow, like the hands of a clock.
+
+### 8.4 Why the exponent is `2j/d`
+
+- `2j` is the index of the first dimension of pair `j`. The exponent is
+  "dimension index / dimension", the same as the sinusoidal encoding of
+  Vaswani et al. (2017): `PE(pos, 2i) = sin(pos / 10000^(2i/d))`.
+- `2j/d = j/(d/2)`: the fraction of the pairs before pair `j`. It goes from
+  `0` to `(d − 2)/d < 1`.
+- With `j/d`, the exponent would stop at about `0.5`, and the slowest speed
+  would be `1/√b` instead of almost `1/b`.
+- **The division by `d` normalizes** the exponent to `[0, 1)`. The speed
+  range is then `(1/b, 1]` for every `d`. Without it, `d = 128` would give
+  `θ₆₃ = 10000^(−126) = 10^(−504)`, which is `0` in `f64`.
+
+### 8.5 Monotonicity
+
+`b^x = e^(x·ln b)` and `ln b > 0` for `b > 1`. Thus `b^x` increases with
+`x`, the exponent `2j/d` increases with `j`, and `θⱼ = 1/b^(2j/d)`
+**decreases** with `j`:
+
+```text
+1 = θ₀ > θ₁ > ... > θ_(d/2−1) = b^(−(d−2)/d) > 1/b
+```
+
+`b = 1` gives `θⱼ = 1` for all `j`. `0 < b < 1` reverses the order. Thus the
+implementation requires `b > 1`.
+
+### 8.6 Geometric sequence and wavelength
+
+```text
+θ_(j+1) / θⱼ = b^(−2/d)      (constant)       →  θⱼ = (b^(−2/d))^j
+ln θⱼ = −(2j/d)·ln b          (linear in j: log-uniform spacing)
+λⱼ = 2π / θⱼ = 2π·b^(2j/d)    (from 2π ≈ 6.28 to almost 2π·b)
+```
+
+### 8.7 Numerical derivation: `d = 8`, `b = 10000 = 10⁴`
+
+`b^x = 10^(4x)`. Four pairs, `j = 0, 1, 2, 3`:
+
+| `j` | `2j/d` | `b^(2j/d)` | `θⱼ` | `λⱼ` |
+|---|---|---|---|---|
+| 0 | 0/8 = 0 | 10⁰ = 1 | 1 | 6.28 |
+| 1 | 2/8 = 0.25 | 10¹ = 10 | 0.1 | 62.83 |
+| 2 | 4/8 = 0.5 | 10² = 100 | 0.01 | 628.32 |
+| 3 | 6/8 = 0.75 | 10³ = 1000 | 0.001 | 6283.19 |
+
+Ratio `10000^(−2/8) = 0.1`. For `d = 64`: ratio `10^(−1/8) ≈ 0.7499`, last
+`θ ≈ 1.3335e−4`. For `d = 128`: ratio `10^(−1/16) ≈ 0.8660`, last
+`θ ≈ 1.1548e−4`.
+
+### 8.8 Positional angles
+
+```text
+φ(m, j) = m · θⱼ          (radians = positions × radians per position)
+```
+
+`m` is the token position (a non-negative integer). Derivation: each step of
+one position adds the same angle `θⱼ`, so `φ(m, j) = φ(0, j) + m·θⱼ` with
+`φ(0, j) = 0`.
+
+Angle table, `d = 8`, `b = 10000`:
+
+| `m` | `j = 0` | `j = 1` | `j = 2` | `j = 3` |
+|---|---|---|---|---|
+| 0 | 0 | 0 | 0 | 0 |
+| 1 | 1 | 0.1 | 0.01 | 0.001 |
+| 2 | 2 | 0.2 | 0.02 | 0.002 |
+| 3 | 3 | 0.3 | 0.03 | 0.003 |
+| 4 | 4 | 0.4 | 0.04 | 0.004 |
+
+- **Position 0:** `0·θⱼ = 0`, so `R = I`. The first token is not changed.
+- **Same position, different pairs:** `θⱼ` decreases strictly, so
+  `m·θⱼ` decreases strictly for `m ≥ 1`. All angles of one token differ.
+- **Fixed pair, increasing position:** linear, step `θⱼ`.
+
+### 8.9 From the angle to the rotation matrix
+
+```text
+R(m, j) = [ cos(m·θⱼ)   −sin(m·θⱼ) ]
+          [ sin(m·θⱼ)    cos(m·θⱼ) ]
+```
+
+`(d, b, j)` give the speed `θⱼ`. `m` gives how far: `m·θⱼ`. Section 5 gives
+the matrix. Properties (tested in `angle_table_defines_rope_rotation_matrices`):
+
+```text
+R(0, j) = I,     R(m, j) = R(1, j)^m,     R(m, j)ᵀ R(n, j) = R(n − m, j)
+```
+
+### 8.10 Precision of positions and angles
+
+- `f64` stores every integer `m ≤ 2^53` exactly. Above, `2^53 + 1` converts
+  to `2^53`. Thus `Position` requires `m ≤ 2^53`.
+- `3 · 0.1 = 0.30000000000000004` in `f64`: `0.1` is not exact in binary.
+- The absolute error of `m·θ` is about `|m·θ| · 1.1e−16` in `f64`. Measured
+  for `θ = 10000^(−2/64)`: the `f32` angle at `m = 10⁶` differs from the
+  `f64` angle by `0.022` radian.
+
+## 9. The relative-position property — per pair tested (Stage 3); full vector planned (Stage 4)
 
 Already proved for one pair of dimensions in Stage 2:
 
@@ -269,6 +400,11 @@ Complex form:  Re[q e^(imθ) · conj(k e^(inθ))] = Re[q conj(k) e^(i(m − n)θ
 
 Both are tested in `tests/numerical_tests.rs`. Planned: the extension to all
 `d/2` pairs with the block-diagonal rotation matrix.
+
+> **Status update (2026-11-01):** Stage 3 tests the property for each pair
+> with matrices built from the `AngleTable` (section 8.9). The extension to
+> the full `d`-dimensional vector moves to Stage 4, because Stage 3 does not
+> rotate vectors.
 
 ## 10. Dimension layouts — planned (Stage 4)
 
