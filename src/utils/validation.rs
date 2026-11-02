@@ -157,6 +157,26 @@ pub enum RopeError {
         /// The rotary dimension `d`.
         rotary_dimension: usize,
     },
+    /// A `sin`/`cos` table has a different number of pairs than the RoPE
+    /// configuration. (Added in Stage 9.)
+    TablePairCountMismatch {
+        /// The number of pairs `d/2` of the configuration.
+        expected: usize,
+        /// The number of pairs of the table.
+        actual: usize,
+    },
+    /// A `sin`/`cos` table does not contain all positions
+    /// `start, ..., start + length − 1` of a tensor. (Added in Stage 9.)
+    TableDoesNotCoverPositions {
+        /// The first position of the table.
+        table_start: usize,
+        /// The number of positions in the table.
+        table_length: usize,
+        /// The first position of the tensor.
+        start: usize,
+        /// The number of positions of the tensor (the sequence length `S`).
+        length: usize,
+    },
 }
 
 impl fmt::Display for RopeError {
@@ -224,7 +244,8 @@ impl fmt::Display for RopeError {
             ),
             RopeError::QueryKeyShapeMismatch { query, key } => write!(
                 f,
-                "the query tensor has (batch, sequence) = {query:?},                  but the key tensor has {key:?}; they must be equal"
+                "the query tensor has (batch, sequence) = {query:?}, \
+                 but the key tensor has {key:?}; they must be equal"
             ),
             RopeError::RotaryDimensionTooLarge {
                 rotary_dimension,
@@ -251,6 +272,19 @@ impl fmt::Display for RopeError {
             RopeError::NtkRequiresLargerDimension { rotary_dimension } => write!(
                 f,
                 "NTK-aware scaling needs a rotary dimension of at least 4, got {rotary_dimension}"
+            ),
+            RopeError::TablePairCountMismatch { expected, actual } => write!(
+                f,
+                "the sin/cos table has {actual} pairs, but the RoPE configuration has {expected}"
+            ),
+            RopeError::TableDoesNotCoverPositions {
+                table_start,
+                table_length,
+                start,
+                length,
+            } => write!(
+                f,
+                "the sin/cos table contains {table_length} positions from {table_start},                  but the tensor needs {length} positions from {start}"
             ),
         }
     }
@@ -283,8 +317,8 @@ pub fn validate_dimension(dimension: usize) -> Result<(), RopeError> {
     if dimension == 0 {
         return Err(RopeError::ZeroDimension);
     }
-    // `%` is the remainder operator. An even number has remainder 0.
-    if dimension % 2 != 0 {
+    // `is_multiple_of(2)` is true for an even number (remainder 0 after division by 2).
+    if !dimension.is_multiple_of(2) {
         return Err(RopeError::OddDimension { dimension });
     }
     Ok(())

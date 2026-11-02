@@ -55,6 +55,28 @@ We add new sources when a stage needs them.
     https://doc.rust-lang.org/nomicon/
 14. *The Rust Performance Book.* https://nnethercote.github.io/perf-book/
 
+## Performance engineering (Stage 9)
+
+22. Criterion.rs (0.8). https://docs.rs/criterion — statistical
+    benchmarking: linear-regression timing, bootstrap confidence intervals,
+    Tukey outlier classification. Used as a dev-dependency only.
+23. Williams, S., Waterman, A., Patterson, D. (2009). *Roofline: An
+    Insightful Visual Performance Model for Multicore Architectures.*
+    Communications of the ACM 52(4). — Arithmetic intensity and the
+    memory-bound limit.
+24. Amdahl, G. M. (1967). *Validity of the Single Processor Approach to
+    Achieving Large Scale Computing Capabilities.* AFIPS Conference
+    Proceedings 30. — The limit of parallel speedup.
+25. Black, S., et al. (2022). *GPT-NeoX-20B: An Open-Source Autoregressive
+    Language Model.* arXiv:2204.06745. — The split-half rotary layout and
+    the partial rotary dimension (Stage 7).
+26. Karpathy, A. (2015). *char-rnn* (Tiny Shakespeare dataset,
+    `tinyshakespeare/input.txt`, 1 115 394 bytes).
+    https://github.com/karpathy/char-rnn — the end-to-end benchmark text.
+27. Payne, M. H., Hanek, R. N. (1983). *Radian Reduction for Trigonometric
+    Functions.* ACM SIGNUM Newsletter 18(1). — Why `sin` of a large angle
+    costs more (range reduction).
+
 ## Validation tooling (Stage 6)
 
 21. PyTorch (2.15.0, CPU build). https://pytorch.org — used only in

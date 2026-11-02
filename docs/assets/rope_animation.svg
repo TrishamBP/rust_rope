@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" role="img" aria-labelledby="t d">
+  <title id="t">How RoPE rotates an embedding</title>
+  <desc id="d">Left: an 8-dimensional vector is split into 4 pairs. Each pair rotates on its own circle with the speed theta j: 1, 0.5, 0.25 and 0.125 radians per position. Right: a query at position m and a key at position n rotate with the same speed, so the angle between them stays constant. The attention score depends only on m minus n.</desc>
+  <defs>
+    <marker id="hq" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f4a261"/></marker>
+    <marker id="hk" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8ecae6"/></marker>
+    <g id="dial">
+      <circle r="46" fill="#232833" stroke="#3d4452" stroke-width="1.5"/>
+      <line x1="-46" y1="0" x2="46" y2="0" stroke="#3d4452"/>
+      <line x1="0" y1="-46" x2="0" y2="46" stroke="#3d4452"/>
+    </g>
+  </defs>
+  <style>
+    .h { font: 700 17px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: #e9ecef; }
+    .s { font: 13px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: #adb5bd; }
+    .m { font: 13px 'JetBrains Mono',Consolas,'DejaVu Sans Mono',monospace; fill: #ced4da; }
+    .q { fill: #f4a261; } .k { fill: #8ecae6; }
+  </style>
+
+  <rect width="900" height="330" rx="20" fill="#1b1f27"/>
+
+  <!-- ===== Left panel: one vector, four pairs, four speeds ===== -->
+  <text x="30" y="38" class="h">1 · Each pair rotates at its own speed θⱼ</text>
+  <text x="30" y="60" class="s">x = [x₀ x₁ | x₂ x₃ | x₄ x₅ | x₆ x₇]: pair j turns by φ = m·θⱼ</text>
+  <text x="30" y="78" class="s">d = 8, b = 16 (a small base, so that all speeds are visible), one position per second</text>
+
+  <g transform="translate(85 160)">
+    <use href="#dial"/>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hq)">
+      <animateTransform attributeName="transform" type="rotate" from="0" to="-360" dur="6.283s" repeatCount="indefinite"/>
+    </line>
+    <circle r="3.5" fill="#e9ecef"/>
+    <text y="72" text-anchor="middle" class="m">j = 0</text>
+    <text y="90" text-anchor="middle" class="m">θ₀ = 1</text>
+  </g>
+  <g transform="translate(200 160)">
+    <use href="#dial"/>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hq)">
+      <animateTransform attributeName="transform" type="rotate" from="0" to="-360" dur="12.566s" repeatCount="indefinite"/>
+    </line>
+    <circle r="3.5" fill="#e9ecef"/>
+    <text y="72" text-anchor="middle" class="m">j = 1</text>
+    <text y="90" text-anchor="middle" class="m">θ₁ = 0.5</text>
+  </g>
+  <g transform="translate(315 160)">
+    <use href="#dial"/>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hq)">
+      <animateTransform attributeName="transform" type="rotate" from="0" to="-360" dur="25.133s" repeatCount="indefinite"/>
+    </line>
+    <circle r="3.5" fill="#e9ecef"/>
+    <text y="72" text-anchor="middle" class="m">j = 2</text>
+    <text y="90" text-anchor="middle" class="m">θ₂ = 0.25</text>
+  </g>
+  <g transform="translate(430 160)">
+    <use href="#dial"/>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hq)">
+      <animateTransform attributeName="transform" type="rotate" from="0" to="-360" dur="50.265s" repeatCount="indefinite"/>
+    </line>
+    <circle r="3.5" fill="#e9ecef"/>
+    <text y="72" text-anchor="middle" class="m">j = 3</text>
+    <text y="90" text-anchor="middle" class="m">θ₃ = 0.125</text>
+  </g>
+  <text x="30" y="300" class="s">Fast pairs (small j) resolve nearby tokens. Slow pairs (large j) separate distant tokens.</text>
+
+  <line x1="505" y1="30" x2="505" y2="305" stroke="#3d4452" stroke-dasharray="4 5"/>
+
+  <!-- ===== Right panel: relative position ===== -->
+  <text x="530" y="38" class="h">2 · Attention sees only m − n</text>
+  <text x="530" y="60" class="s"><tspan class="q">q</tspan> at position m, <tspan class="k">k</tspan> at position n = m − 3, same θ = 0.5</text>
+
+  <g transform="translate(640 175)">
+    <circle r="78" fill="#232833" stroke="#3d4452" stroke-width="1.5"/>
+    <line x1="-78" y1="0" x2="78" y2="0" stroke="#3d4452"/>
+    <line x1="0" y1="-78" x2="0" y2="78" stroke="#3d4452"/>
+    <!-- Both vectors rotate together: the angle (m − n)·θ = 1.5 rad stays fixed. -->
+    <g>
+      <!-- k at angle 0, q at angle 1.5 rad = 85.9°. The arc shows the fixed gap. -->
+      <path d="M 34 0 A 34 34 0 0 0 2.4 -33.9" fill="none" stroke="#e9ecef" stroke-width="2"/>
+      <line x1="0" y1="0" x2="70" y2="0" stroke="#8ecae6" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hk)"/>
+      <line x1="0" y1="0" x2="5" y2="-69.8" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#hq)"/>
+      <text x="40" y="-28" class="m" font-size="12">3θ</text>
+      <animateTransform attributeName="transform" type="rotate" from="0" to="-360" dur="12.566s" repeatCount="indefinite"/>
+    </g>
+    <circle r="4" fill="#e9ecef"/>
+  </g>
+  <text x="735" y="140" class="m">⟨R(mθ)q, R(nθ)k⟩</text>
+  <text x="735" y="162" class="m">= ⟨q, R((n−m)θ)k⟩</text>
+  <text x="735" y="194" class="s">m and n grow,</text>
+  <text x="735" y="212" class="s">the gap stays 3θ,</text>
+  <text x="735" y="230" class="s">the score stays</text>
+  <text x="735" y="248" class="s">the same.</text>
+  <text x="530" y="300" class="s">This is the core property of RoPE (Su et al., 2021).</text>
+</svg>

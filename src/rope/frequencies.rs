@@ -8,6 +8,12 @@
 //! - [`angle`]: one positional angle `φ(m, j) = m · θⱼ`.
 //! - [`AngleTable`]: the angles for many positions and all pairs.
 //!
+//! ## Implemented (Stage 9)
+//!
+//! - [`SinCosTable`]: the values `sin φ(m, j)` and `cos φ(m, j)` for many
+//!   positions and all pairs (a "cos/sin cache"). The rotation code reads
+//!   them and does not call `sin_cos` again.
+//!
 //! ## Not implemented in this stage
 //!
 //! The sine, the cosine and the rotation of embedding vectors are planned
@@ -41,6 +47,7 @@
 //! Example with `d = 8`, `b = 10000`: `θ = [1, 0.1, 0.01, 0.001]`.
 //! At position `m = 3`: `φ = [3, 0.3, 0.03, 0.003]`.
 
+use crate::math::trigonometry::sin_cos;
 use crate::rope::config::RopeConfig;
 use crate::rope::position::{Position, PositionRange};
 use crate::utils::validation::{
@@ -321,6 +328,180 @@ impl AngleTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 9: the sin/cos table (cache)
+// ---------------------------------------------------------------------------
+
+/// The values `sin φ(m, j)` and `cos φ(m, j)` for a range of positions `m`
+/// and all pairs `j`, with `φ(m, j) = m · θⱼ`.
+///
+/// # Why a table?
+///
+/// A `[B, S, H, D]` tensor has `B · S · H · d/2` pairs. But the angle
+/// `φ(m, j)` depends only on the position `m` and the pair `j`. It does not
+/// depend on the batch element `b` or the head `h`. Thus only `S · d/2`
+/// different angles exist. Without a table, the rotation calls `sin_cos`
+/// `B · H` times for each angle. With a table, it calls `sin_cos` one time
+/// for each angle, and each rotation does only 4 multiplications and
+/// 2 additions.
+///
+/// Example: `B = 2`, `S = 512`, `H = 16`, `d = 64`. Without the table:
+/// 524 288 `sin_cos` calls. With the table: 16 384 calls (32 times fewer).
+///
+/// # Memory layout: two separate arrays
+///
+/// The table keeps `sin` and `cos` in **two** row-major `Vec<f64>`
+/// ("structure of arrays"). The value for row `r` and pair `j` is at the
+/// index `r · P + j` in each array (`P` = number of pairs).
+///
+/// ```text
+/// sin: [ s(0,0) s(0,1) ... s(0,P−1) | s(1,0) ... ]   one row per position
+/// cos: [ c(0,0) c(0,1) ... c(0,P−1) | c(1,0) ... ]
+/// ```
+///
+/// One row of `sin` and one row of `cos` are each one contiguous slice.
+/// The rotation loop walks the pairs `j = 0, 1, 2, ...` and reads both
+/// slices in increasing memory order. The compiler can load several
+/// consecutive `cos` values into one vector register (SIMD).
+///
+/// # Memory use
+///
+/// `2 · L · P · 8` bytes. Example: `L = 4096` positions, `d = 128`
+/// (`P = 64`): 4 MiB. PyTorch models keep the same kind of buffers
+/// (`cos_cached`, `sin_cached`).
+///
+/// # Exactness
+///
+/// The table stores the result of the same `sin_cos(m · θⱼ)` call that the
+/// rotation without a table uses. Thus a rotation with the table gives
+/// **bit-identical** results.
+///
+/// # Example
+///
+/// ```
+/// use rust_rope::rope::config::RopeConfig;
+/// use rust_rope::rope::frequencies::{inverse_frequencies, SinCosTable};
+/// use rust_rope::rope::position::{Position, PositionRange};
+///
+/// let theta = inverse_frequencies(&RopeConfig::new(4, 10_000.0)?); // [1, 0.01]
+/// let table = SinCosTable::new(PositionRange::from_zero(3)?, &theta)?;
+///
+/// let m = Position::new(2)?;
+/// assert_eq!(table.sin_row(m), Some(&[2f64.sin(), 0.02f64.sin()][..]));
+/// assert_eq!(table.cos_row(m), Some(&[2f64.cos(), 0.02f64.cos()][..]));
+/// # Ok::<(), rust_rope::utils::validation::RopeError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct SinCosTable {
+    positions: PositionRange,
+    num_pairs: usize,
+    /// Row-major: `sin[r * num_pairs + j] = sin((start + r) · θⱼ)`.
+    sin: Vec<f64>,
+    /// Row-major: `cos[r * num_pairs + j] = cos((start + r) · θⱼ)`.
+    cos: Vec<f64>,
+}
+
+impl SinCosTable {
+    /// Calculates `sin(m · θⱼ)` and `cos(m · θⱼ)` for each position `m` in
+    /// `positions` and each `θⱼ` in `inverse_frequencies`.
+    ///
+    /// The function borrows `inverse_frequencies`. It allocates two
+    /// `Vec<f64>` with exactly `L · P` elements each.
+    ///
+    /// # Errors
+    ///
+    /// - [`RopeError::EmptyFrequencies`] if `inverse_frequencies` is empty.
+    /// - [`RopeError::InvalidInverseFrequency`] if a value is not a finite
+    ///   number greater than 0.
+    /// - [`RopeError::TableTooLarge`] if `L · P` does not fit in a `usize`.
+    pub fn new(positions: PositionRange, inverse_frequencies: &[f64]) -> Result<Self, RopeError> {
+        validate_inverse_frequencies(inverse_frequencies)?;
+        Self::new_unchecked(positions, inverse_frequencies)
+    }
+
+    /// The constructor without the frequency check. `RotaryEmbedding` uses
+    /// it: its frequencies come from a validated configuration.
+    pub(crate) fn new_unchecked(
+        positions: PositionRange,
+        inverse_frequencies: &[f64],
+    ) -> Result<Self, RopeError> {
+        let num_pairs = inverse_frequencies.len();
+        let num_elements =
+            positions
+                .len()
+                .checked_mul(num_pairs)
+                .ok_or(RopeError::TableTooLarge {
+                    rows: positions.len(),
+                    columns: num_pairs,
+                })?;
+
+        let mut sin = Vec::with_capacity(num_elements);
+        let mut cos = Vec::with_capacity(num_elements);
+        for position in positions.iter() {
+            for &theta in inverse_frequencies {
+                // The same two steps as the rotation without a table:
+                // φ = m·θⱼ, then one sin_cos(φ) call.
+                let (s, c) = sin_cos(angle_unchecked(position, theta));
+                sin.push(s);
+                cos.push(c);
+            }
+        }
+        debug_assert_eq!(sin.len(), num_elements);
+
+        Ok(SinCosTable {
+            positions,
+            num_pairs,
+            sin,
+            cos,
+        })
+    }
+
+    /// Returns the range of positions (the rows of the table).
+    pub fn positions(&self) -> PositionRange {
+        self.positions
+    }
+
+    /// Returns the number of positions `L` (the number of rows).
+    pub fn num_positions(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Returns the number of pairs `P` (the number of columns).
+    pub fn num_pairs(&self) -> usize {
+        self.num_pairs
+    }
+
+    /// Returns the memory that the two arrays use, in bytes: `2 · L · P · 8`.
+    pub fn size_in_bytes(&self) -> usize {
+        (self.sin.len() + self.cos.len()) * std::mem::size_of::<f64>()
+    }
+
+    /// Returns `[sin(m·θ₀), sin(m·θ₁), ...]` for the position `m`, or `None`
+    /// if the table does not contain `m`.
+    pub fn sin_row(&self, position: Position) -> Option<&[f64]> {
+        let r = self.positions.index_of(position)?;
+        Some(self.rows_at(r).0)
+    }
+
+    /// Returns `[cos(m·θ₀), cos(m·θ₁), ...]` for the position `m`, or `None`
+    /// if the table does not contain `m`.
+    pub fn cos_row(&self, position: Position) -> Option<&[f64]> {
+        let r = self.positions.index_of(position)?;
+        Some(self.rows_at(r).1)
+    }
+
+    /// Returns the `sin` row and the `cos` row with the row **index** `r`
+    /// (not the position). The caller must check `r < L`.
+    ///
+    /// `pub(crate)`: the rotation loop in `rope::embeddings` uses it.
+    #[inline]
+    pub(crate) fn rows_at(&self, r: usize) -> (&[f64], &[f64]) {
+        let start = r * self.num_pairs;
+        let end = start + self.num_pairs;
+        (&self.sin[start..end], &self.cos[start..end])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +631,21 @@ mod tests {
                     columns: 1 << 11
                 })
             );
+        }
+    }
+
+    #[test]
+    fn sin_cos_table_matches_the_angle_table() {
+        let theta = inverse_frequencies(&RopeConfig::new(8, 10_000.0).unwrap());
+        let range = PositionRange::new(3, 6).unwrap();
+        let angles = AngleTable::new(range, &theta).unwrap();
+        let table = SinCosTable::new(range, &theta).unwrap();
+        for m in range.iter() {
+            for (j, &phi) in angles.row(m).unwrap().iter().enumerate() {
+                let (s, c) = phi.sin_cos();
+                assert_eq!(table.sin_row(m).unwrap()[j], s);
+                assert_eq!(table.cos_row(m).unwrap()[j], c);
+            }
         }
     }
 }

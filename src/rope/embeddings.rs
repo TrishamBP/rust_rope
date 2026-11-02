@@ -21,10 +21,22 @@
 //!   rotary dimension `d`), selected in the [`RopeConfig`]. All methods
 //!   (vectors and tensors) support them through one loop.
 //!
+//! ## Implemented (Stage 9)
+//!
+//! - [`RotaryEmbedding::sin_cos_table`]: builds a [`SinCosTable`] (a
+//!   `cos`/`sin` cache) for a range of positions.
+//! - [`RotaryEmbedding::rotate_tensor_with_table`] and
+//!   [`RotaryEmbedding::rotate_query_key_with_table`]: the tensor rotation
+//!   without trigonometry. Bit-identical to the Stage 5 functions.
+//! - [`RotaryEmbedding::rotate_tensor_parallel`]: the same rotation on
+//!   several threads ([`std::thread::scope`]).
+//!
 //! ## Not implemented
 //!
 //! - ~~The split-half dimension layout.~~ Implemented in Stage 7.
-//! - Attention, softmax, caches of `cos`/`sin`: outside the current scope.
+//! - ~~Caches of `cos`/`sin`.~~ Implemented in Stage 9 ([`SinCosTable`]).
+//! - Attention and softmax: outside the scope of the project.
+//! - `f32` tensors and explicit SIMD: not implemented (explain.md, Entry 17).
 //!
 //! ## The transformation
 //!
@@ -66,13 +78,14 @@
 //! results with an external implementation only after you confirm its
 //! layout.
 
-use crate::math::tensor::Tensor4;
+use crate::math::tensor::{Tensor4, TensorShape};
 use crate::rope::config::{RopeConfig, RopeLayout};
-use crate::rope::frequencies::{angle_unchecked, inverse_frequencies};
+use crate::rope::frequencies::{SinCosTable, angle_unchecked, inverse_frequencies};
 use crate::rope::position::{Position, PositionRange};
-use crate::rope::rotations::rotate_pair;
+use crate::rope::rotations::{rotate_pair, rotate_pair_sin_cos};
 use crate::rope::scaling::{RopeScaling, scaled_inverse_frequencies};
 use crate::utils::validation::{RopeError, validate_embedding_dimension};
+use std::num::NonZeroUsize;
 
 /// The RoPE transformation for one configuration (`d`, `b`), with the
 /// interleaved (adjacent-pair) layout.
@@ -397,6 +410,306 @@ impl RotaryEmbedding {
         Ok((q, k))
     }
 
+    // -----------------------------------------------------------------------
+    // Stage 9: rotation with a sin/cos table, and multithreaded rotation
+    // -----------------------------------------------------------------------
+
+    /// Calculates the `sin`/`cos` table for `positions` with the
+    /// frequencies of this transformation (Stage 9).
+    ///
+    /// Build the table **one time** for the longest sequence that you
+    /// expect (for example, the context length of the model). Then use it
+    /// for every tensor with [`RotaryEmbedding::rotate_tensor_with_table`].
+    ///
+    /// # Errors
+    ///
+    /// [`RopeError::TableTooLarge`] if `L · d/2` does not fit in a `usize`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_rope::math::tensor::{Tensor4, TensorShape};
+    /// use rust_rope::rope::config::RopeConfig;
+    /// use rust_rope::rope::embeddings::RotaryEmbedding;
+    /// use rust_rope::rope::position::{Position, PositionRange};
+    ///
+    /// let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0)?);
+    /// let table = rope.sin_cos_table(PositionRange::from_zero(1024)?)?;
+    ///
+    /// let shape = TensorShape::new(2, 16, 4, 8);
+    /// let input = Tensor4::from_fn(shape, |b, s, h, d| (b + s + h + d) as f64)?;
+    /// let (mut cached, mut direct) = (input.clone(), input);
+    ///
+    /// // Tokens 100..116, for example a second chunk of a long text.
+    /// let start = Position::new(100)?;
+    /// rope.rotate_tensor_with_table(&mut cached, &table, start)?;
+    /// rope.rotate_tensor_in_place(&mut direct, start)?;
+    /// assert_eq!(cached, direct); // bit-identical
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn sin_cos_table(&self, positions: PositionRange) -> Result<SinCosTable, RopeError> {
+        SinCosTable::new_unchecked(positions, &self.inverse_frequencies)
+    }
+
+    /// Checks that `table` fits this transformation and contains the `S`
+    /// positions `start, ..., start + S − 1`. Returns the table row of
+    /// `start`.
+    fn check_table(
+        &self,
+        table: &SinCosTable,
+        start: Position,
+        sequence: usize,
+    ) -> Result<usize, RopeError> {
+        let expected = self.inverse_frequencies.len();
+        if table.num_pairs() != expected {
+            return Err(RopeError::TablePairCountMismatch {
+                expected,
+                actual: table.num_pairs(),
+            });
+        }
+        let needed = PositionRange::new(start.value(), sequence)?;
+        let table_start = table.positions().start().value();
+        let table_end = table_start + table.num_positions(); // no overflow: ≤ 2^53 + 1
+        let needed_end = start.value() + needed.len();
+        if start.value() < table_start || needed_end > table_end {
+            return Err(RopeError::TableDoesNotCoverPositions {
+                table_start,
+                table_length: table.num_positions(),
+                start: start.value(),
+                length: sequence,
+            });
+        }
+        Ok(start.value() - table_start)
+    }
+
+    /// Applies RoPE to every head vector of a `[B, S, H, D]` tensor, in
+    /// place, with precomputed `sin`/`cos` values (Stage 9).
+    ///
+    /// The result is **bit-identical** to
+    /// [`RotaryEmbedding::rotate_tensor_in_place`]. The difference is the
+    /// speed: this function calls no trigonometric function. Each pair costs
+    /// 4 multiplications and 2 additions (plus the attention factor).
+    ///
+    /// The table must come from [`RotaryEmbedding::sin_cos_table`] of the
+    /// **same** transformation. The function checks the number of pairs and
+    /// the positions. It cannot check the values of the frequencies. A table
+    /// from a different base or scaling method gives wrong rotations.
+    ///
+    /// No heap allocation.
+    ///
+    /// # Errors
+    ///
+    /// - [`RopeError::EmbeddingDimensionMismatch`] if `D` is not the head
+    ///   dimension.
+    /// - [`RopeError::TablePairCountMismatch`] if the table has a different
+    ///   number of pairs.
+    /// - [`RopeError::TableDoesNotCoverPositions`] if the table does not
+    ///   contain the positions `start, ..., start + S − 1`.
+    /// - [`RopeError::SequenceTooLong`] if `start + S − 1 > 2^53`.
+    ///
+    /// On an error, the tensor does not change.
+    pub fn rotate_tensor_with_table(
+        &self,
+        tensor: &mut Tensor4,
+        table: &SinCosTable,
+        start: Position,
+    ) -> Result<(), RopeError> {
+        let shape = tensor.shape();
+        validate_embedding_dimension(shape.features, self.dimension())?;
+        let first_row = self.check_table(table, start, shape.sequence)?;
+        self.rotate_tokens_with_table(tensor.as_mut_slice(), 0, shape, table, first_row);
+        Ok(())
+    }
+
+    /// Applies RoPE to a query tensor and a key tensor, in place, with a
+    /// `sin`/`cos` table (Stage 9). The rules are the same as for
+    /// [`RotaryEmbedding::rotate_query_key_in_place`]. Both tensors use the
+    /// same table rows, so one table serves both.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`RotaryEmbedding::rotate_query_key_in_place`] and of
+    /// [`RotaryEmbedding::rotate_tensor_with_table`]. On an error, neither
+    /// tensor changes.
+    pub fn rotate_query_key_with_table(
+        &self,
+        query: &mut Tensor4,
+        key: &mut Tensor4,
+        table: &SinCosTable,
+        start: Position,
+    ) -> Result<(), RopeError> {
+        self.check_query_key(query, key, start)?;
+        let first_row = self.check_table(table, start, query.shape().sequence)?;
+        let (q_shape, k_shape) = (query.shape(), key.shape());
+        self.rotate_tokens_with_table(query.as_mut_slice(), 0, q_shape, table, first_row);
+        self.rotate_tokens_with_table(key.as_mut_slice(), 0, k_shape, table, first_row);
+        Ok(())
+    }
+
+    /// Applies RoPE to a `[B, S, H, D]` tensor with `threads` operating
+    /// system threads and a `sin`/`cos` table (Stage 9).
+    ///
+    /// The function divides the `B · S` tokens into `threads` contiguous
+    /// blocks. Each thread rotates one block. The blocks do not overlap, so
+    /// the threads never write to the same value. The result is
+    /// **bit-identical** to [`RotaryEmbedding::rotate_tensor_with_table`].
+    ///
+    /// ```text
+    /// data: [ token 0 | token 1 | ... | token B·S−1 ]
+    ///         └─ thread 0 ─┘└─ thread 1 ─┘ ... └─ thread n−1 ─┘
+    /// ```
+    ///
+    /// Starting a thread costs time (tens of microseconds on many
+    /// systems). For small tensors, the single-threaded function is faster.
+    /// See the Stage 9 benchmark results in `explain.md` (Entry 17).
+    ///
+    /// The function uses [`std::thread::scope`]. All threads finish before
+    /// the function returns. Thus the threads can borrow `self`, `table` and
+    /// the tensor data without `Arc` or copies. `threads` is a
+    /// [`NonZeroUsize`]: the type system excludes 0 threads.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`RotaryEmbedding::rotate_tensor_with_table`].
+    ///
+    /// # Panics
+    ///
+    /// If the operating system cannot start a thread, or if a thread panics
+    /// (an internal bug).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use rust_rope::math::tensor::{Tensor4, TensorShape};
+    /// use rust_rope::rope::config::RopeConfig;
+    /// use rust_rope::rope::embeddings::RotaryEmbedding;
+    /// use rust_rope::rope::position::{Position, PositionRange};
+    ///
+    /// let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0)?);
+    /// let table = rope.sin_cos_table(PositionRange::from_zero(64)?)?;
+    /// let shape = TensorShape::new(3, 64, 2, 8);
+    /// let input = Tensor4::from_fn(shape, |b, s, h, d| (b * s + h + d) as f64)?;
+    ///
+    /// let (mut serial, mut parallel) = (input.clone(), input);
+    /// rope.rotate_tensor_with_table(&mut serial, &table, Position::ZERO)?;
+    /// let threads = NonZeroUsize::new(4).unwrap();
+    /// rope.rotate_tensor_parallel(&mut parallel, &table, Position::ZERO, threads)?;
+    /// assert_eq!(serial, parallel);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn rotate_tensor_parallel(
+        &self,
+        tensor: &mut Tensor4,
+        table: &SinCosTable,
+        start: Position,
+        threads: NonZeroUsize,
+    ) -> Result<(), RopeError> {
+        let shape = tensor.shape();
+        validate_embedding_dimension(shape.features, self.dimension())?;
+        let first_row = self.check_table(table, start, shape.sequence)?;
+
+        let num_tokens = shape.batch * shape.sequence; // ≥ 1: no zero extents
+        let token_len = shape.heads * shape.features; // H·D values per token
+        // More threads than tokens would give empty blocks.
+        let threads = threads.get().min(num_tokens);
+        // Round up, so that `threads` blocks contain all tokens.
+        let tokens_per_block = num_tokens.div_ceil(threads);
+
+        let data = tensor.as_mut_slice();
+        if threads == 1 {
+            // No thread start for one block: the current thread does the work.
+            self.rotate_tokens_with_table(data, 0, shape, table, first_row);
+            return Ok(());
+        }
+
+        // `chunks_mut` gives non-overlapping `&mut [f64]` blocks. Each block
+        // moves into exactly one thread. The borrow checker proves that no
+        // two threads can write to the same memory.
+        std::thread::scope(|scope| {
+            for (block_index, block) in data.chunks_mut(tokens_per_block * token_len).enumerate() {
+                // `move` copies the references `self` and `table` and moves
+                // `block` into the thread. `RotaryEmbedding` and
+                // `SinCosTable` are `Sync`, so shared references can cross
+                // threads.
+                scope.spawn(move || {
+                    let first_token = block_index * tokens_per_block;
+                    self.rotate_tokens_with_table(block, first_token, shape, table, first_row);
+                });
+            }
+            // The end of `scope` waits for (joins) every thread. A panic in
+            // a thread continues as a panic here.
+        });
+        Ok(())
+    }
+
+    /// The table loop for a block of whole tokens. `tokens` starts at the
+    /// global token index `first_token` (`= b · S + s`). The caller must
+    /// check the shape and the table.
+    ///
+    /// ```text
+    /// for each token t in the block:     s = t mod S, row = first_row + s
+    ///     (sin, cos) = table rows of row
+    ///     for each head h: rotate the head vector with (sin, cos)
+    /// ```
+    fn rotate_tokens_with_table(
+        &self,
+        tokens: &mut [f64],
+        first_token: usize,
+        shape: TensorShape,
+        table: &SinCosTable,
+        first_row: usize,
+    ) {
+        let token_len = shape.heads * shape.features;
+        debug_assert_eq!(tokens.len() % token_len, 0);
+        for (offset, token) in tokens.chunks_exact_mut(token_len).enumerate() {
+            // The sequence index of this token. All batch elements use the
+            // same positions, so `s` restarts at 0 in each batch element.
+            let s = (first_token + offset) % shape.sequence;
+            let (sin, cos) = table.rows_at(first_row + s);
+            for head in token.chunks_exact_mut(shape.features) {
+                self.rotate_pairs_with_table(head, sin, cos);
+            }
+        }
+    }
+
+    /// The RoPE loop for one head vector with precomputed `sin`/`cos`
+    /// rows. It has the same structure as `rotate_pairs`. The only
+    /// difference: it reads `sin φ` and `cos φ` and does not calculate them.
+    #[inline]
+    fn rotate_pairs_with_table(&self, embedding: &mut [f64], sin: &[f64], cos: &[f64]) {
+        let rotary_dimension = self.config.rotary_dimension();
+        debug_assert_eq!(embedding.len(), self.config.head_dimension());
+        debug_assert_eq!(sin.len(), rotary_dimension / 2);
+        debug_assert_eq!(cos.len(), rotary_dimension / 2);
+
+        let (rotary, _pass_through) = embedding.split_at_mut(rotary_dimension);
+        let factor = self.attention_factor;
+
+        match self.config.layout() {
+            RopeLayout::Interleaved => {
+                // `as_chunks_mut::<2>()` views the slice as `&mut [[f64; 2]]`.
+                // The length 2 is part of the type, so the compiler needs no
+                // bounds check for `pair[0]` and `pair[1]` (Stage 9, step 1).
+                let (pairs, rest) = rotary.as_chunks_mut::<2>();
+                debug_assert!(rest.is_empty()); // d is even
+                for ((pair, &s), &c) in pairs.iter_mut().zip(sin).zip(cos) {
+                    let [ra, rb] = rotate_pair_sin_cos(*pair, s, c);
+                    *pair = [ra * factor, rb * factor];
+                }
+            }
+            RopeLayout::SplitHalf => {
+                let (first, second) = rotary.split_at_mut(rotary_dimension / 2);
+                for (((a, b), &s), &c) in first.iter_mut().zip(second.iter_mut()).zip(sin).zip(cos)
+                {
+                    let [ra, rb] = rotate_pair_sin_cos([*a, *b], s, c);
+                    *a = ra * factor;
+                    *b = rb * factor;
+                }
+            }
+        }
+    }
+
     /// The tensor loop. The caller must check `D = d` and the positions.
     ///
     /// The nested `chunks_exact_mut` calls follow the memory layout
@@ -437,7 +750,7 @@ impl RotaryEmbedding {
     /// ```text
     /// embedding:  [ x0 x1 x2 x3 x4 x5 | x6 x7 ]      d = 6, D = 8
     ///               └── rotary (d) ──┘  └ pass ┘
-    /// Interleaved:  rotary.chunks_exact_mut(2) → (x0,x1) (x2,x3) (x4,x5)
+    /// Interleaved:  rotary.as_chunks_mut::<2>() → (x0,x1) (x2,x3) (x4,x5)
     /// SplitHalf:    rotary.split_at_mut(3)     → (x0,x3) (x1,x4) (x2,x5)
     /// ```
     fn rotate_pairs(&self, embedding: &mut [f64], position: Position) {
@@ -454,15 +767,18 @@ impl RotaryEmbedding {
 
         match self.config.layout() {
             RopeLayout::Interleaved => {
-                // `chunks_exact_mut(2)`: the adjacent pairs (x₂ⱼ, x₂ⱼ₊₁).
+                // `as_chunks_mut::<2>()`: the adjacent pairs (x₂ⱼ, x₂ⱼ₊₁) as
+                // `[f64; 2]` arrays. (Stage 4 used `chunks_exact_mut(2)`,
+                // which gives slices of unknown length; Stage 9 changed it.)
                 // `zip` walks the pairs and the frequencies together.
-                for (pair, &theta) in rotary.chunks_exact_mut(2).zip(&self.inverse_frequencies) {
+                let (pairs, rest) = rotary.as_chunks_mut::<2>();
+                debug_assert!(rest.is_empty()); // d is even
+                for (pair, &theta) in pairs.iter_mut().zip(&self.inverse_frequencies) {
                     let phi = angle_unchecked(position, theta); // φ = m·θⱼ
-                    let [ra, rb] = rotate_pair([pair[0], pair[1]], phi); // R(φ)·(x₂ⱼ, x₂ⱼ₊₁)
+                    let [ra, rb] = rotate_pair(*pair, phi); // R(φ)·(x₂ⱼ, x₂ⱼ₊₁)
                     // Write back into the same two slots. `factor` is 1.0
                     // except for YaRN; `x · 1.0 = x` exactly.
-                    pair[0] = ra * factor;
-                    pair[1] = rb * factor;
+                    *pair = [ra * factor, rb * factor];
                 }
             }
             RopeLayout::SplitHalf => {

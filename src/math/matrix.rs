@@ -355,6 +355,26 @@ impl Matrix2 {
     /// counterclockwise for `θ > 0`. The rotation keeps the length of `v`.
     pub fn rotation(theta: f64) -> Matrix2 {
         let (sin, cos) = sin_cos(theta);
+        Matrix2::rotation_from_sin_cos(sin, cos)
+    }
+
+    /// Creates the rotation matrix from the values `sin(θ)` and `cos(θ)`
+    /// that the caller already has (Stage 9).
+    ///
+    /// ```text
+    /// R = [ cos  −sin ]
+    ///     [ sin   cos ]
+    /// ```
+    ///
+    /// This function does no trigonometry. A caller that keeps a table of
+    /// `sin` and `cos` values (a cache) uses it to skip the expensive
+    /// `sin_cos` call. [`Matrix2::rotation`] also uses it, so the matrix
+    /// layout exists in one place only.
+    ///
+    /// The function does not check that `sin² + cos² = 1`. Values that are
+    /// not from one angle give a matrix that is not a rotation.
+    #[inline]
+    pub const fn rotation_from_sin_cos(sin: f64, cos: f64) -> Matrix2 {
         Matrix2::new(cos, -sin, sin, cos)
     }
 }
@@ -382,6 +402,27 @@ impl Matrix2 {
 /// ```
 pub fn rotate_vector(v: Vector2, theta: f64) -> Vector2 {
     Matrix2::rotation(theta).mul_vector(v)
+}
+
+/// Rotates the vector `v` with precomputed `sin(θ)` and `cos(θ)` values
+/// (Stage 9).
+///
+/// The result is **bit-identical** to `rotate_vector(v, θ)` when
+/// `(sin, cos) == sin_cos(θ)`: both functions build the same matrix and do
+/// the same 4 multiplications and 2 additions in the same order.
+///
+/// # Example
+///
+/// ```
+/// use rust_rope::math::matrix::{rotate_vector, rotate_vector_sin_cos};
+///
+/// let theta = 0.7_f64;
+/// let (sin, cos) = theta.sin_cos();
+/// assert_eq!(rotate_vector_sin_cos([3.0, -1.0], sin, cos), rotate_vector([3.0, -1.0], theta));
+/// ```
+#[inline]
+pub fn rotate_vector_sin_cos(v: Vector2, sin: f64, cos: f64) -> Vector2 {
+    Matrix2::rotation_from_sin_cos(sin, cos).mul_vector(v)
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (j, (&theta, (pair, out))) in rope
             .inverse_frequencies()
             .iter()
-            .zip(x.chunks_exact(2).zip(y.chunks_exact(2)))
+            .zip(x.as_chunks::<2>().0.iter().zip(y.as_chunks::<2>().0))
             .enumerate()
         {
             let phi = position.as_f64() * theta;

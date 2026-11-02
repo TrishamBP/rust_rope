@@ -436,7 +436,13 @@ fn invariant_b_pair_magnitudes_are_preserved() {
         let x = test_vector(d, 1.0);
         for m in [1, 2, 17, 1000, 1_000_000] {
             let y = r.rotate(&x, pos(m)).unwrap();
-            for (j, (p, q)) in x.chunks_exact(2).zip(y.chunks_exact(2)).enumerate() {
+            for (j, (p, q)) in x
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(y.as_chunks::<2>().0)
+                .enumerate()
+            {
                 let before = p[0] * p[0] + p[1] * p[1];
                 let after = q[0] * q[0] + q[1] * q[1];
                 assert!(close(before, after), "d = {d}, m = {m}, j = {j}");
@@ -661,8 +667,10 @@ fn tensor_test_b_pair_magnitudes_are_preserved() {
     r.rotate_tensor_in_place(&mut q2, pos(1000)).unwrap();
     for (before, after) in q
         .as_slice()
-        .chunks_exact(2)
-        .zip(q2.as_slice().chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(q2.as_slice().as_chunks::<2>().0)
     {
         let (n0, n1) = (
             before[0] * before[0] + before[1] * before[1],
@@ -951,5 +959,140 @@ fn scaling_is_numerically_stable_at_large_positions() {
                 "{s:?} m = {m}"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Stage 9: the sin/cos table and the parallel rotation are exact
+// ===========================================================================
+//
+// The Stage 9 functions are optimizations. An optimization must not change
+// the result. The tolerance in these tests is therefore **zero**: we compare
+// with `assert_eq!` (bit-identical values). This is possible because the
+// table stores the result of the same `sin_cos(m·θⱼ)` call, and the rotation
+// does the same multiplications and additions in the same order. Rust does
+// not reorder floating-point operations and does not fuse `a·b + c` into
+// one instruction unless the code asks for it.
+
+use rust_rope::rope::frequencies::SinCosTable;
+use std::num::NonZeroUsize;
+
+/// Every combination of layout, full/partial rotation and scaling method.
+fn stage9_embeddings() -> Vec<RotaryEmbedding> {
+    let mut all = Vec::new();
+    for layout in [RopeLayout::Interleaved, RopeLayout::SplitHalf] {
+        for rotary in [32, 16] {
+            let c = RopeConfig::new(rotary, 10_000.0)
+                .unwrap()
+                .with_layout(layout)
+                .with_head_dimension(32)
+                .unwrap();
+            for s in [
+                RopeScaling::None,
+                RopeScaling::Linear { factor: 4.0 },
+                RopeScaling::NtkAware { factor: 8.0 },
+                RopeScaling::yarn(16.0, 512),
+            ] {
+                all.push(RotaryEmbedding::with_scaling(c, s).unwrap());
+            }
+        }
+    }
+    all
+}
+
+/// The table rotation is bit-identical to the Stage 5 rotation, for every
+/// configuration and for start positions inside a larger table.
+#[test]
+fn table_rotation_is_bit_identical_to_direct_rotation() {
+    let shape = TensorShape::new(2, 9, 3, 32);
+    let input = Tensor4::from_fn(shape, |b, s, h, d| {
+        ((b * 1000 + s * 100 + h * 10 + d) as f64 * 0.37).sin() * 3.0
+    })
+    .unwrap();
+    for rope in stage9_embeddings() {
+        // One table for the positions 0..4096 serves every start below.
+        let table = rope
+            .sin_cos_table(PositionRange::from_zero(4096).unwrap())
+            .unwrap();
+        for start in [0, 1, 500, 4096 - 9] {
+            let mut direct = input.clone();
+            rope.rotate_tensor_in_place(&mut direct, pos(start))
+                .unwrap();
+            let mut cached = input.clone();
+            rope.rotate_tensor_with_table(&mut cached, &table, pos(start))
+                .unwrap();
+            assert_eq!(cached, direct, "{:?} start = {start}", rope.config());
+        }
+    }
+}
+
+/// The parallel rotation is bit-identical to the single-threaded table
+/// rotation, for thread counts that divide the tokens evenly and unevenly.
+#[test]
+fn parallel_rotation_is_bit_identical() {
+    // B·S = 3·7 = 21 tokens: 2, 4, 5 and 8 threads give unequal blocks,
+    // and some blocks start in the middle of a batch element.
+    let shape = TensorShape::new(3, 7, 2, 32);
+    let input = Tensor4::from_fn(shape, |b, s, h, d| {
+        (b as f64 - s as f64) * 0.1 + (h * d) as f64
+    })
+    .unwrap();
+    for rope in stage9_embeddings() {
+        let table = rope
+            .sin_cos_table(PositionRange::new(40, 20).unwrap())
+            .unwrap();
+        let mut expected = input.clone();
+        rope.rotate_tensor_with_table(&mut expected, &table, pos(50))
+            .unwrap();
+        for n in [1, 2, 3, 4, 5, 7, 8, 21, 64] {
+            let mut t = input.clone();
+            let threads = NonZeroUsize::new(n).unwrap();
+            rope.rotate_tensor_parallel(&mut t, &table, pos(50), threads)
+                .unwrap();
+            assert_eq!(t, expected, "{:?} threads = {n}", rope.config());
+        }
+    }
+}
+
+/// Each table entry satisfies sin² + cos² = 1 (within rounding), also at
+/// large positions. Tolerance: `DEFAULT_TOLERANCE` (1e-12). Each of `sin`
+/// and `cos` has an error of about 1 ulp (1.1e-16), so the sum of squares
+/// has an error of a few times 1e-16.
+#[test]
+fn sin_cos_table_entries_lie_on_the_unit_circle() {
+    let theta = inverse_frequencies(&config(64, 10_000.0));
+    let table = SinCosTable::new(PositionRange::new(1_000_000, 64).unwrap(), &theta).unwrap();
+    for m in table.positions().iter() {
+        let (sin, cos) = (table.sin_row(m).unwrap(), table.cos_row(m).unwrap());
+        for (j, (&s, &c)) in sin.iter().zip(cos).enumerate() {
+            assert!(close(s * s + c * c, 1.0), "m = {}, j = {j}", m.value());
+        }
+    }
+}
+
+/// The relative-position property also holds for the table rotation:
+/// the score of a query at m and a key at n depends only on m − n.
+#[test]
+fn table_rotation_keeps_the_relative_position_property() {
+    let rope = RotaryEmbedding::new(config(16, 10_000.0));
+    let table = rope
+        .sin_cos_table(PositionRange::from_zero(2048).unwrap())
+        .unwrap();
+    let q0 = test_vector(16, 0.3);
+    let k0 = test_vector(16, 1.7);
+    let rotated_at = |v: &[f64], m: usize| {
+        let mut t = Tensor4::new(TensorShape::new(1, 1, 1, 16), v.to_vec()).unwrap();
+        rope.rotate_tensor_with_table(&mut t, &table, pos(m))
+            .unwrap();
+        t.into_vec()
+    };
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    // Distance 5 at three different absolute positions.
+    let reference = dot(&rotated_at(&q0, 12), &rotated_at(&k0, 7));
+    for (m, n) in [(105, 100), (1005, 1000), (2000, 1995)] {
+        let score = dot(&rotated_at(&q0, m), &rotated_at(&k0, n));
+        // Tolerance 1e-9: the angles m·θ are large (up to 2000 rad), and the
+        // rounding error of φ grows with m (about m · 1.1e-16 rad).
+        assert!(approx_eq(score, reference, 1e-9), "m = {m}, n = {n}");
     }
 }

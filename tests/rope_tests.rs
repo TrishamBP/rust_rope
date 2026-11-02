@@ -314,8 +314,8 @@ fn position_one_rotates_pair_j_by_theta_j() {
     let r = rope(8, 10_000.0);
     let x = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
     let y = r.rotate(&x, pos(1)).unwrap();
-    // `chunks_exact(2)` gives the output pairs; `enumerate` gives j.
-    for (j, pair) in y.chunks_exact(2).enumerate() {
+    // `as_chunks::<2>()` gives the output pairs; `enumerate` gives j.
+    for (j, pair) in y.as_chunks::<2>().0.iter().enumerate() {
         let theta = r.inverse_frequencies()[j];
         assert!(all_close(pair, &[theta.cos(), theta.sin()]), "pair {j}");
     }
@@ -1104,4 +1104,190 @@ fn yarn_attention_factor_scales_only_the_rotary_part() {
     assert!(approx_eq(y[0], 3.0 * factor, DEFAULT_TOLERANCE));
     assert!(approx_eq(y[1], 4.0 * factor, DEFAULT_TOLERANCE));
     assert_eq!(&y[4..], &[7.0, -7.0]);
+}
+
+// ===========================================================================
+// Stage 9: sin/cos table, table rotation, multithreaded rotation (API)
+// ===========================================================================
+
+use rust_rope::rope::frequencies::SinCosTable;
+use std::num::NonZeroUsize;
+
+fn threads(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
+
+#[test]
+fn sin_cos_table_shape_and_lookup() {
+    let theta = inverse_frequencies(&RopeConfig::new(8, 10_000.0).unwrap());
+    let table = SinCosTable::new(PositionRange::new(10, 5).unwrap(), &theta).unwrap();
+    assert_eq!(table.num_positions(), 5);
+    assert_eq!(table.num_pairs(), 4);
+    assert_eq!(table.positions().start(), pos(10));
+    // 2 arrays · 5 rows · 4 pairs · 8 bytes.
+    assert_eq!(table.size_in_bytes(), 2 * 5 * 4 * 8);
+    // Positions outside 10..15 are not in the table.
+    assert_eq!(table.sin_row(pos(9)), None);
+    assert_eq!(table.cos_row(pos(15)), None);
+    let (s, c) = (12.0 * theta[1]).sin_cos();
+    assert_eq!(table.sin_row(pos(12)).unwrap()[1], s);
+    assert_eq!(table.cos_row(pos(12)).unwrap()[1], c);
+}
+
+#[test]
+fn sin_cos_table_rejects_invalid_frequencies() {
+    let range = PositionRange::from_zero(4).unwrap();
+    assert_eq!(
+        SinCosTable::new(range, &[]),
+        Err(RopeError::EmptyFrequencies)
+    );
+    assert!(SinCosTable::new(range, &[1.0, f64::NAN]).is_err());
+    assert!(SinCosTable::new(range, &[1.0, -0.5]).is_err());
+}
+
+#[test]
+fn sin_cos_table_from_the_embedding_uses_its_frequencies() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(16, 500_000.0).unwrap());
+    let range = PositionRange::from_zero(32).unwrap();
+    let from_rope = rope.sin_cos_table(range).unwrap();
+    let direct = SinCosTable::new(range, rope.inverse_frequencies()).unwrap();
+    assert_eq!(from_rope, direct);
+}
+
+#[test]
+fn table_rotation_rejects_a_table_with_the_wrong_number_of_pairs() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0).unwrap());
+    let other = RotaryEmbedding::new(RopeConfig::new(4, 10_000.0).unwrap());
+    let table = other
+        .sin_cos_table(PositionRange::from_zero(8).unwrap())
+        .unwrap();
+    let mut t =
+        Tensor4::from_fn(TensorShape::new(1, 4, 1, 8), |_, s, _, d| (s + d) as f64).unwrap();
+    let before = t.clone();
+    assert_eq!(
+        rope.rotate_tensor_with_table(&mut t, &table, Position::ZERO),
+        Err(RopeError::TablePairCountMismatch {
+            expected: 4,
+            actual: 2
+        })
+    );
+    assert_eq!(t, before);
+}
+
+#[test]
+fn table_rotation_rejects_positions_outside_the_table() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0).unwrap());
+    // The table contains the positions 100..110.
+    let table = rope
+        .sin_cos_table(PositionRange::new(100, 10).unwrap())
+        .unwrap();
+    let mut t = Tensor4::zeros(TensorShape::new(2, 4, 3, 8)).unwrap();
+
+    // 100..104 and 106..110 are inside the table.
+    assert!(
+        rope.rotate_tensor_with_table(&mut t, &table, pos(100))
+            .is_ok()
+    );
+    assert!(
+        rope.rotate_tensor_with_table(&mut t, &table, pos(106))
+            .is_ok()
+    );
+    // 99..103 starts before the table; 107..111 ends after it.
+    for start in [99, 107, 0, 1_000] {
+        assert_eq!(
+            rope.rotate_tensor_with_table(&mut t, &table, pos(start)),
+            Err(RopeError::TableDoesNotCoverPositions {
+                table_start: 100,
+                table_length: 10,
+                start,
+                length: 4
+            }),
+            "start = {start}"
+        );
+    }
+    // The parallel function uses the same checks.
+    assert!(
+        rope.rotate_tensor_parallel(&mut t, &table, pos(107), threads(2))
+            .is_err()
+    );
+}
+
+#[test]
+fn table_rotation_rejects_a_wrong_head_dimension() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0).unwrap());
+    let table = rope
+        .sin_cos_table(PositionRange::from_zero(4).unwrap())
+        .unwrap();
+    let mut t = Tensor4::zeros(TensorShape::new(1, 4, 1, 6)).unwrap();
+    assert_eq!(
+        rope.rotate_tensor_with_table(&mut t, &table, Position::ZERO),
+        Err(RopeError::EmbeddingDimensionMismatch {
+            expected: 8,
+            actual: 6
+        })
+    );
+}
+
+#[test]
+fn query_key_with_table_checks_both_tensors_first() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0).unwrap());
+    let table = rope
+        .sin_cos_table(PositionRange::from_zero(4).unwrap())
+        .unwrap();
+    let mut q = Tensor4::from_fn(TensorShape::new(1, 4, 2, 8), |_, s, h, d| {
+        (s + h + d) as f64
+    })
+    .unwrap();
+    let mut k = Tensor4::zeros(TensorShape::new(1, 3, 2, 8)).unwrap(); // S differs
+    let q_before = q.clone();
+    assert!(matches!(
+        rope.rotate_query_key_with_table(&mut q, &mut k, &table, Position::ZERO),
+        Err(RopeError::QueryKeyShapeMismatch { .. })
+    ));
+    assert_eq!(q, q_before);
+}
+
+#[test]
+fn query_key_with_table_equals_the_stage_5_function() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(8, 10_000.0).unwrap());
+    let table = rope
+        .sin_cos_table(PositionRange::from_zero(64).unwrap())
+        .unwrap();
+    // Grouped-query attention: 4 query heads, 2 key heads.
+    let q = Tensor4::from_fn(TensorShape::new(2, 5, 4, 8), |b, s, h, d| {
+        (b + 2 * s + h) as f64 - d as f64 * 0.5
+    })
+    .unwrap();
+    let k = Tensor4::from_fn(TensorShape::new(2, 5, 2, 8), |b, s, h, d| {
+        (b * s + h * d) as f64
+    })
+    .unwrap();
+    let (q_expected, k_expected) = rope.rotate_query_key(&q, &k, pos(7)).unwrap();
+    let (mut q2, mut k2) = (q, k);
+    rope.rotate_query_key_with_table(&mut q2, &mut k2, &table, pos(7))
+        .unwrap();
+    assert_eq!(q2, q_expected);
+    assert_eq!(k2, k_expected);
+}
+
+#[test]
+fn parallel_rotation_with_more_threads_than_tokens() {
+    let rope = RotaryEmbedding::new(RopeConfig::new(4, 10_000.0).unwrap());
+    let table = rope
+        .sin_cos_table(PositionRange::from_zero(3).unwrap())
+        .unwrap();
+    // B·S = 3 tokens, but 16 threads: the function uses only 3 blocks.
+    let input = Tensor4::from_fn(TensorShape::new(1, 3, 2, 4), |_, s, h, d| {
+        (s * 7 + h * 3 + d) as f64
+    })
+    .unwrap();
+    let mut expected = input.clone();
+    rope.rotate_tensor_in_place(&mut expected, Position::ZERO)
+        .unwrap();
+    for n in [1, 2, 3, 16] {
+        let mut t = input.clone();
+        rope.rotate_tensor_parallel(&mut t, &table, Position::ZERO, threads(n))
+            .unwrap();
+        assert_eq!(t, expected, "threads = {n}");
+    }
 }

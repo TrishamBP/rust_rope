@@ -5,6 +5,12 @@
 //! - [`rotate_pair`]: rotates one pair of embedding dimensions
 //!   `(x₂ⱼ, x₂ⱼ₊₁)` by the angle `φ`.
 //!
+//! ## Implemented (Stage 9)
+//!
+//! - [`rotate_pair_sin_cos`]: the same rotation with precomputed `sin φ` and
+//!   `cos φ` (from a [`crate::rope::frequencies::SinCosTable`]). It skips
+//!   the `sin_cos` call, which is the most expensive step of the rotation.
+//!
 //! ## The equation
 //!
 //! ```text
@@ -30,7 +36,7 @@
 //! library. This module gives the operation its RoPE name and documents the
 //! RoPE meaning of the inputs.
 
-use crate::math::matrix::{Vector2, rotate_vector};
+use crate::math::matrix::{Vector2, rotate_vector, rotate_vector_sin_cos};
 
 /// Rotates one pair of embedding values `[x₂ⱼ, x₂ⱼ₊₁]` by the angle `φ`
 /// (in radians) and returns the rotated pair `[x'₂ⱼ, x'₂ⱼ₊₁]`.
@@ -73,6 +79,31 @@ pub fn rotate_pair(pair: Vector2, phi: f64) -> Vector2 {
     rotate_vector(pair, phi)
 }
 
+/// Rotates one pair with precomputed `sin φ` and `cos φ` (Stage 9).
+///
+/// ```text
+/// x'₂ⱼ   = x₂ⱼ · cos φ − x₂ⱼ₊₁ · sin φ
+/// x'₂ⱼ₊₁ = x₂ⱼ · sin φ + x₂ⱼ₊₁ · cos φ
+/// ```
+///
+/// The cost is 4 multiplications and 2 additions: no trigonometry. If
+/// `(sin, cos) == φ.sin_cos()`, the result is **bit-identical** to
+/// [`rotate_pair`]`(pair, φ)`. Both call the same matrix code.
+///
+/// # Example
+///
+/// ```
+/// use rust_rope::rope::rotations::{rotate_pair, rotate_pair_sin_cos};
+///
+/// let phi = 1.25_f64;
+/// let (sin, cos) = phi.sin_cos();
+/// assert_eq!(rotate_pair_sin_cos([3.0, 4.0], sin, cos), rotate_pair([3.0, 4.0], phi));
+/// ```
+#[inline]
+pub fn rotate_pair_sin_cos(pair: Vector2, sin: f64, cos: f64) -> Vector2 {
+    rotate_vector_sin_cos(pair, sin, cos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +122,16 @@ mod tests {
             let (s, c) = phi.sin_cos();
             let expected = [x0 * c - x1 * s, x0 * s + x1 * c];
             assert!(close(rotate_pair([x0, x1], phi), expected), "φ = {phi}");
+        }
+    }
+
+    #[test]
+    fn precomputed_sin_cos_is_bit_identical() {
+        for phi in [-3.0_f64, 0.0, 1e-9, 0.5, 2.0, 1e4, 1e9] {
+            let (s, c) = phi.sin_cos();
+            for pair in [[1.0, 0.0], [1.5, -2.0], [-1e10, 3e-8]] {
+                assert_eq!(rotate_pair_sin_cos(pair, s, c), rotate_pair(pair, phi));
+            }
         }
     }
 

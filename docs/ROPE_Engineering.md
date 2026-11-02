@@ -2288,6 +2288,14 @@ from an independent Python `math` calculation (`explain.md`, Entry 14).
 > of the existing simple benchmark (`benches/rope_benchmark.rs`). SIMD,
 > Rayon, `sin`/`cos` caches, loop variants, Criterion and build-flag
 > experiments are **not implemented** and **not measured**.
+>
+> **Status update (2026-11-02):** Stage 9 is now complete. The `sin`/`cos`
+> table (`SinCosTable`), the multithreaded rotation, the Criterion suite
+> (`benches/rope_criterion.rs`), the allocation test and the build-flag
+> experiments are implemented and measured. The chapters below keep the
+> pre-Stage 9 text. The new results are in `explain.md`, Entry 17, section
+> 8, and in `README.md`, section 6. Explicit SIMD and Rayon remain **not
+> implemented**.
 
 ## Chapter 24: Understanding CPU Performance
 

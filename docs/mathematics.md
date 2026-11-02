@@ -7,6 +7,11 @@ examples, are in `explain.md` (the entry numbers are given below).
 > **Status:** Stage 8 is complete. Sections 2–8 and 12–16 are
 > **implemented**. Sections 9–11 were planning notes; their status notes
 > point to the implemented sections. Stage 9 (CPU performance) is planned.
+>
+> **Status update (2026-11-02):** Stage 9 is complete. Its mathematics
+> (the `sin`/`cos` table, arithmetic intensity, the roofline model,
+> Amdahl's law, the cost of range reduction, Criterion's statistics) is in
+> `explain.md`, Entry 17, section 3.
 
 ---
 

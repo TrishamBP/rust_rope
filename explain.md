@@ -33,6 +33,7 @@ Each implementation milestone adds one new entry.
 | 14 | 2026-11-01 | Stage 7 | Interleaved and split-half layouts (`RopeLayout`) |
 | 15 | 2026-11-01 | Stage 7 | Partial RoPE, tensor integration, Stage 7 validation results |
 | 16 | 2026-11-01 | Stage 8 | RoPE scaling: position interpolation, linear, NTK-aware, YaRN |
+| 17 | 2026-11-02 | Stage 9 | CPU performance: Criterion, `SinCosTable`, threads, allocation counting, build flags |
 
 ---
 
@@ -7516,3 +7517,651 @@ This table shows the current state, with the redefined stage numbers.
 | 7 Layouts and partial RoPE | ✅ Done (Entries 14–15) |
 | 8 RoPE scaling | ✅ Done (Entry 16) — review pending |
 | 9 CPU performance engineering | ⏳ Planned — waits for approval |
+
+---
+
+# Stage 9 — CPU Performance Engineering
+
+# Entry 17 — Benchmarks, the `sin`/`cos` table, threads and build settings (Stage 9)
+
+**Date:** 2026-11-02
+**Stage:** 9 (CPU performance engineering)
+**Files:** `benches/rope_criterion.rs` (new), `tests/allocation_tests.rs`
+(new), `src/rope/frequencies.rs` (`SinCosTable`), `src/rope/embeddings.rs`
+(`sin_cos_table`, `rotate_tensor_with_table`,
+`rotate_query_key_with_table`, `rotate_tensor_parallel`, `as_chunks_mut`
+in the hot loops), `src/rope/rotations.rs` (`rotate_pair_sin_cos`),
+`src/math/matrix.rs` (`Matrix2::rotation_from_sin_cos`,
+`rotate_vector_sin_cos`), `src/utils/validation.rs` (2 new errors),
+`Cargo.toml` (Criterion dev-dependency), tests, `README.md`,
+`docs/assets/` (logo, animation, chart)
+
+### Implementation status of this entry
+
+| Item | Status |
+|---|---|
+| Criterion benchmark suite (7 groups, 44 benchmarks) | ✅ Implemented |
+| End-to-end benchmark on Tiny Shakespeare (with a synthetic fallback) | ✅ Implemented |
+| `SinCosTable` (the `cos`/`sin` cache) and table rotation | ✅ Implemented, bit-identical |
+| Multithreaded rotation with `std::thread::scope` | ✅ Implemented, bit-identical |
+| `as_chunks_mut::<2>()` in the interleaved loops | ✅ Implemented and measured |
+| Allocation counting test (custom global allocator) | ✅ Implemented |
+| Build-setting experiments (`target-cpu=native`, LTO) | ✅ Measured; **not** made the default |
+| Explicit SIMD (`std::arch` intrinsics or `std::simd`) | ❌ Not implemented (needs `unsafe` or the nightly compiler) |
+| `f32` tensors (generic element type) | ❌ Not implemented (section 7) |
+| Rayon | ❌ Not used: `std::thread::scope` is sufficient (section 6) |
+| Fused RoPE inside an attention kernel | ❌ Outside the scope: the project has no attention kernel |
+
+---
+
+## 1. What did we build?
+
+Stage 9 does three things.
+
+1. **Measurement.** A statistical benchmark suite with Criterion. It
+   measures the existing code (the "baseline") and every new variant.
+   Each optimization was measured on its own, before and after.
+2. **Optimizations.** A `sin`/`cos` table (cache), a multithreaded
+   rotation, and a loop change that removes bounds checks. All three give
+   **bit-identical** results; the tests compare with `assert_eq!`.
+3. **Evidence.** An allocation test that counts heap allocations, and a
+   comparison of build settings.
+
+The public API only grew. No Stage 1–8 function changed its signature or
+its results.
+
+## 2. Why did we build it?
+
+The Stage 5 benchmark gave one number per case (best and median of 15
+runs). It did not answer three questions:
+
+- **Where does the time go?** Trigonometry, memory traffic, or loop
+  overhead?
+- **Is a difference real?** Two runs of the Stage 5 benchmark differed by
+  up to 20 % (ROPE_Engineering.md, section 30.4). Without statistics, we
+  cannot separate a real change from noise.
+- **What is the limit?** How fast can the computer move the data at all?
+
+A Transformer applies RoPE to every query and key, in every layer, for
+every token. A 32-layer model applies it 64 times per token. Thus RoPE
+speed matters, although RoPE is a small part of a model.
+
+## 3. Mathematical foundation
+
+### 3.1 The cost model of one pair
+
+For one pair `(x, y)` at the position `m`, the rotation is:
+
+```text
+φ  = m · θⱼ                         1 multiplication
+(s, c) = (sin φ, cos φ)             1 sin_cos call (≈ 20–40 floating-point operations)
+x' = x·c − y·s                      2 multiplications, 1 subtraction
+y' = x·s + y·c                      2 multiplications, 1 addition
+x'' = x'·f,  y'' = y'·f             2 multiplications (f = attention factor)
+```
+
+`sin_cos` is the expensive step. A good `sin` implementation has three
+parts: **range reduction** (find `k` and `r` with `φ = k·π/2 + r` and
+`|r| ≤ π/4`), a **polynomial** of degree 10–14 in `r`, and a selection of
+sign and function by `k mod 4`. Large angles make the range reduction
+harder: `m · θ₀ = m` can be 100 000 rad.
+
+### 3.2 Why a table removes most of the work
+
+The angle `φ(m, j) = m·θⱼ` depends on `m` and `j` only. A tensor
+`[B, S, H, D]` has `B·S·H·d/2` pairs, but only `S·d/2` different angles.
+
+```text
+sin_cos calls without a table:  N_direct = B · S · H · d/2
+sin_cos calls with a table:     N_table  = S · d/2            (one time)
+ratio:                          N_direct / N_table = B · H
+```
+
+Example: `B = 1`, `S = 2048`, `H = 32`, `d = 128`.
+`N_direct = 4 194 304`, `N_table = 131 072`, ratio 32. And the table is
+built **one time** for the whole model: all layers and all forward passes
+reuse it. Thus its cost is zero in a long run.
+
+**Precision.** The table stores exactly the value `sin_cos(m·θⱼ)`. The
+rotation reads it and does the same 6 operations in the same order. IEEE
+754 operations are deterministic (the same inputs give the same output).
+Rust never reorders floating-point operations and never contracts
+`a·b + c` into one fused multiply–add instruction unless the code asks
+for it (`f64::mul_add`). Therefore the result is **bit-identical**, and
+the tests use a tolerance of 0.
+
+### 3.3 Arithmetic intensity and the memory limit
+
+**Arithmetic intensity** `I` is the number of floating-point operations
+(FLOPs) per byte that moves between the memory and the processor:
+
+```text
+I = FLOPs / bytes
+```
+
+With the table, one pair costs 6 FLOPs (8 with the attention factor). In
+place, the pair moves `16` bytes in (two `f64`) and `16` bytes out. The
+table rows are small and stay in the cache (for `S = 2048`, `d = 128`:
+`2 · 2048 · 64 · 8 B = 2 MiB`, smaller than the 16 MiB L3 cache).
+
+```text
+I ≈ 8 FLOPs / 32 bytes = 0.25 FLOP/byte
+```
+
+The **roofline model** says: a program cannot be faster than
+`min(peak FLOP rate, I × memory bandwidth)`. This computer has DDR5-4800
+memory in two channels:
+
+```text
+peak bandwidth = 2 channels · 4800·10⁶ transfers/s · 8 bytes = 76.8 GB/s
+```
+
+One core can do about `3.2·10⁹ cycles/s · 8 FLOP/cycle` (two AVX2 `f64`
+operations of 4 lanes each) `≈ 25 GFLOP/s`. Then:
+
+```text
+memory limit:  0.25 FLOP/byte · 76.8 GB/s = 19 GFLOP/s  ≈ 2.4·10⁹ pairs/s
+```
+
+A pair limit of `76.8 GB/s / 32 B ≈ 2.4·10⁹ pairs/s` (0.42 ns per pair)
+is the **absolute ceiling** for a tensor that does not fit in the cache.
+Real laptops reach about 60–70 % of the peak bandwidth. **Conclusion:**
+with the table, a large RoPE is **memory-bound**: the processor waits for
+memory, not for arithmetic. More threads help only until the memory bus
+is full. The measurements in section 9 confirm this.
+
+Without the table, the intensity is about 5 times higher (≈ 30 FLOPs
+for `sin_cos` per pair, plus the rotation), so the direct rotation is
+**compute-bound**. **Prediction (not measured):** for compute-bound code,
+threads would help almost linearly. We did not measure it, because
+`rotate_tensor_parallel` always uses the table.
+
+### 3.4 Amdahl's law and the cost of threads
+
+If a fraction `p` of the work can run in parallel on `n` threads, the
+best speedup is (Amdahl's law):
+
+```text
+speedup(n) = 1 / ((1 − p) + p/n)
+```
+
+Thread start-up is a serial cost: Windows needs roughly 20–100 µs to
+create and join a thread. A decode step (`[1, 1, 32, 128]`, 2048 pairs)
+takes only a few microseconds. There, threads make the operation many
+times **slower**. For large tensors the start-up cost is small compared
+to the work, but the memory limit of section 3.3 caps the speedup.
+
+### 3.5 The statistics of Criterion
+
+Criterion runs the function in **samples**. Sample `i` runs the function
+`iᵢ` times (a linearly increasing count) and measures the total time
+`tᵢ`. It fits the line `t = β · iters` by ordinary least squares. The
+slope `β` is the time per iteration. A **bootstrap** (resampling the
+samples with replacement 100 000 times) gives a 95 % confidence interval
+for `β`. Criterion prints it as `[lower estimate upper]`. It also
+classifies outliers with Tukey fences: a sample outside
+`[Q1 − 1.5·IQR, Q3 + 1.5·IQR]` (IQR = interquartile range) is a mild
+outlier; outside `3·IQR` it is a severe outlier. When a saved baseline
+exists, Criterion tests the hypothesis "no change" and prints
+"Performance has improved/regressed" only when `p < 0.05` **and** the
+change is larger than the noise threshold (2 % by default).
+
+## 4. Rust concepts learned
+
+### 4.1 Benchmark targets and `harness = false`
+
+**What.** A file in `benches/` is a separate program. `[[bench]]` with
+`harness = false` in `Cargo.toml` tells Cargo: "this file has its own
+`main` function". Criterion's `criterion_main!` macro generates that
+`main`. **Why.** The built-in `#[bench]` attribute needs the nightly
+compiler. **Compiler view.** `cargo bench` compiles with the `bench`
+profile, which inherits the `release` profile (`opt-level = 3`, no debug
+assertions). Thus `debug_assert!` checks disappear from the measured code.
+
+### 4.2 `std::hint::black_box`
+
+```rust
+use std::hint::black_box;
+let x = black_box(5) + 1; // the optimizer must treat 5 as unknown
+```
+
+The optimizer removes code whose result is not used ("dead code
+elimination"). It can also calculate a result at compile time if the
+inputs are constants. `black_box(value)` returns `value`, but the
+optimizer must assume that something reads and changes it. Thus the
+benchmarked work cannot disappear.
+
+### 4.3 Structure of arrays and borrowed rows
+
+`SinCosTable` keeps two `Vec<f64>` (sin and cos), not one
+`Vec<(f64, f64)>`. `rows_at(r)` returns two borrowed slices:
+
+```rust
+pub(crate) fn rows_at(&self, r: usize) -> (&[f64], &[f64]) {
+    let start = r * self.num_pairs;
+    let end = start + self.num_pairs;
+    (&self.sin[start..end], &self.cos[start..end])
+}
+```
+
+The lifetime of both slices is the lifetime of `&self` (lifetime
+elision: one input reference, so the outputs borrow from it). The table
+cannot change or move while a row is in use. No data is copied.
+
+### 4.4 `as_chunks_mut::<N>()`: lengths in the type
+
+```rust
+let v = &mut [1.0, 2.0, 3.0, 4.0, 5.0][..];
+let (pairs, rest) = v.as_chunks_mut::<2>(); // &mut [[f64; 2]], &mut [f64]
+assert_eq!(pairs, &[[1.0, 2.0], [3.0, 4.0]]);
+assert_eq!(rest, &[5.0]);
+```
+
+`chunks_exact_mut(2)` gives items of type `&mut [f64]`: a slice whose
+length is a **run-time** value. `pair[1]` then needs a bounds check,
+unless the optimizer proves that the length is 2. `as_chunks_mut::<2>()`
+gives items of type `&mut [f64; 2]`: the length is part of the **type**,
+known at compile time. `pair[1]` needs no check, and `*pair = [a, b]`
+writes both values at once. `N` is a **const generic** parameter: a
+compile-time constant value (not a type) as a generic argument.
+
+### 4.5 `NonZeroUsize`: make the invalid state impossible
+
+```rust
+use std::num::NonZeroUsize;
+let n = NonZeroUsize::new(4).unwrap(); // Some(4)
+assert!(NonZeroUsize::new(0).is_none()); // 0 is not representable
+```
+
+`rotate_tensor_parallel` takes `threads: NonZeroUsize`. A request for 0
+threads cannot be written, so the function needs no error for it. Also,
+`Option<NonZeroUsize>` has the same size as `usize` (8 bytes): the
+compiler uses the forbidden value 0 to represent `None` ("niche
+optimization").
+
+### 4.6 Scoped threads, `Send` and `Sync`
+
+```rust
+let mut data = vec![1, 2, 3, 4];
+std::thread::scope(|s| {
+    for chunk in data.chunks_mut(2) {
+        s.spawn(move || chunk.iter_mut().for_each(|x| *x *= 10));
+    }
+}); // all threads are joined here
+assert_eq!(data, [10, 20, 30, 40]);
+```
+
+`std::thread::spawn` requires a `'static` closure: the thread can live
+longer than the function, so it cannot borrow local data. A **scope** is
+different: `scope` returns only after every spawned thread has finished.
+Therefore the threads can **borrow** local data. The compiler checks two
+traits:
+
+- **`Send`**: a value can **move** to another thread. `&mut [f64]` is
+  `Send` because `f64` is `Send`.
+- **`Sync`**: a **shared reference** `&T` can go to another thread.
+  `RotaryEmbedding` and `SinCosTable` contain only `Vec<f64>`, `f64`,
+  `usize` and enums, so the compiler derives `Sync` automatically.
+
+`chunks_mut` gives **non-overlapping** mutable slices. Each slice moves
+into exactly one thread. The borrow checker thus proves at compile time
+that no two threads write to the same `f64`: no data race is possible,
+and no lock is necessary.
+
+### 4.7 A global allocator and `unsafe`
+
+`tests/allocation_tests.rs` installs a `#[global_allocator]` that counts
+allocations. `GlobalAlloc` is an `unsafe trait`. **Safety argument**
+(required by CLAUDE.md, section 6):
+
+1. Every method calls the same method of `std::alloc::System` with the
+   **unchanged** arguments and returns its result unchanged. `System`
+   fulfils the `GlobalAlloc` contract, so the wrapper fulfils it too.
+2. The counter is a `thread_local!` `Cell<usize>` with a `const`
+   initializer. Reading or writing it does not allocate. Thus the
+   allocator never calls itself recursively.
+3. `try_with` instead of `with`: during thread shutdown the thread-local
+   value may already be destroyed. Then the count is skipped, and the
+   allocator does not panic (a panic inside an allocator aborts the
+   program).
+4. The `unsafe` code exists **only** in a test program. The library
+   contains no `unsafe` code.
+
+A thread-local counter is necessary because the test harness runs tests
+on several threads at the same time. A global counter would count the
+allocations of other tests.
+
+## 5. Memory and execution
+
+**Ownership in the table rotation.** `rotate_tensor_with_table(&self,
+tensor: &mut Tensor4, table: &SinCosTable, start)` borrows everything:
+the transformation and the table immutably, the tensor mutably. Nothing
+moves, nothing is copied, nothing is allocated (proved by the allocation
+test).
+
+**Execution flow.**
+
+```text
+check D, check table pairs, check positions (start .. start+S ⊆ table)
+for each token t (B·S tokens, in memory order):
+    s = t mod S; (sin, cos) = table rows (first_row + s)    ← 2 slices, no copy
+    for each head h (H heads):                               ← same rows for every head
+        for each pair j: 4 mul + 2 add (+2 mul for the factor)
+```
+
+The table rows of one token are read once per head. For `d = 128` a row
+pair is `2 · 64 · 8 = 1 KiB`: it stays in the L1 cache (32 KiB) for all
+`H` heads.
+
+**Ownership in the parallel rotation.** `data.chunks_mut(len)` splits the
+one `&mut [f64]` into many disjoint `&mut [f64]`. Each one **moves** into
+a thread closure (`move ||`). The closures also capture `self` and
+`table` as **shared references** (copied pointers). When the scope ends,
+all threads have finished, and the borrows of `data`, `self` and `table`
+end. The tensor is then usable again.
+
+**Heap use.**
+
+| Object | Heap |
+|---|---|
+| `SinCosTable` | `2 · L · d/2 · 8` bytes (two `Vec<f64>`) |
+| `rotate_tensor_with_table` | none |
+| `rotate_tensor_parallel` | none by the library; the operating system allocates a stack (1–2 MiB reserved) and a small handle per thread |
+
+## 6. Engineering decisions
+
+1. **Measure first.** We saved the baseline (step 0) before the first
+   loop change. Each later step is one change, measured against the
+   previous step.
+2. **Criterion as a dev-dependency.** See section 6.1.
+3. **The table is explicit and optional.** The caller builds it and
+   passes it. Alternative: `RotaryEmbedding` builds and keeps a table
+   inside itself. We did not do this: a `RotaryEmbedding` does not know
+   the maximum position, and a hidden 4 MiB allocation is a surprise.
+   The Stage 5 functions stay unchanged for callers without a table.
+4. **The table is checked, not trusted.** The function checks the number
+   of pairs and the positions. It cannot check that the table comes from
+   the **same** frequencies; the documentation states this.
+5. **`std::thread::scope`, not Rayon.** The work is one flat loop with
+   equal-size blocks; it needs no work stealing. Rayon would be a
+   **library** dependency (not only dev). CLAUDE.md prefers the standard
+   library. A thread pool would remove the start-up cost; section 7
+   discusses it.
+6. **Bit-identical results are a requirement.** An optimization that
+   changes results needs a new numerical analysis. All Stage 9 changes
+   keep the operations and their order, so the tolerance is 0.
+7. **Build flags are documented, not forced.** `target-cpu=native`
+   produces a binary that may not run on an older processor. We measure
+   it and document the command; `Cargo.toml` keeps portable defaults.
+
+### 6.1 The dependency justification: Criterion (CLAUDE.md, section 5)
+
+| Question | Answer |
+|---|---|
+| Purpose | Statistical benchmarks: warm-up, linear-regression timing, bootstrap confidence intervals, outlier detection, comparison with saved baselines. |
+| Why is `std` not sufficient? | `std` gives a clock (`Instant`) and `black_box`. It has no statistics. The Stage 5 benchmark shows the problem: two runs differed by up to 20 %, and we could not tell noise from a real change. Writing a bootstrap and a regression ourselves would be a separate project. |
+| Alternatives | (a) our own `std::time` harness (kept: `benches/rope_benchmark.rs`); (b) `divan` (smaller, newer, less widely documented); (c) the nightly `#[bench]` (no statistics, nightly only); (d) `iai-callgrind` (counts instructions; needs Valgrind, which is not available on Windows). |
+| Cost: compile time | The first `cargo bench` compiles about 45 extra crates (clean build ≈ 30–60 s). Later runs are incremental. `cargo build` does not compile them. `cargo test` compiles them once, because Cargo builds dev-dependencies for every test, example and benchmark target. |
+| Cost: binary size | Zero for the library and `src/main.rs`: `[dev-dependencies]` are linked only into tests, examples and benchmarks. |
+| Cost: trust | Criterion is the most widely used Rust benchmark crate and has a long public history. `default-features = false` removes `plotters` and `rayon` and reduces the tree. `Cargo.lock` pins every version. |
+
+## 7. Alternative approaches
+
+| Alternative | Advantage | Disadvantage | Decision |
+|---|---|---|---|
+| Table inside `RotaryEmbedding` | Simple API | Hidden memory; needs a maximum position | Not done |
+| Interleaved `[cos, sin]` table (array of structs) | One stream instead of two | Split-half loop must de-interleave; less natural for SIMD | Not done |
+| Compute `cos`/`sin` by the angle-addition recurrence `R((m+1)θ) = R(mθ)·R(θ)` | No table, no `sin_cos` per position | Rounding error grows with `m` (about `m · ε`); not bit-identical | Not done; a good exercise |
+| Rayon `par_chunks_mut` | Thread pool, no start-up per call | Library dependency | Not done |
+| A persistent thread pool (own code) | No start-up per call | Needs channels or `Mutex`/`Condvar`; much more code | Not done |
+| Explicit SIMD with `std::arch` | Full control of AVX2 | `unsafe`, platform-specific code | Not done |
+| `std::simd` (portable SIMD) | Safe, portable | Nightly compiler only | Not done |
+| `f32` storage | Half the memory traffic: about 2× for memory-bound sizes | Generic code or duplication; different precision analysis (Entry 13) | Planned option |
+| Fuse RoPE into the Q/K projection or the attention kernel | Removes one full read+write of Q and K | Needs an attention kernel | Outside the scope |
+
+## 8. Performance considerations (the measurements)
+
+### 8.1 Environment and method
+
+| Item | Value |
+|---|---|
+| CPU | AMD Ryzen 7 6800H, 8 cores / 16 threads, L2 512 KiB per core, L3 16 MiB |
+| Memory | 2 × 8 GiB DDR5-4800, theoretical peak 76.8 GB/s |
+| Software | Windows 11, rustc 1.99.1 (`x86_64-pc-windows-msvc`), Criterion 0.8.2 |
+| Build | `cargo bench` (release profile) unless stated |
+| Statistic | Each number is the median of the Criterion medians of 3 complete runs |
+
+### 8.2 Step 0 → step 1: `as_chunks_mut` (a "null result")
+
+Step 1 replaced `chunks_exact_mut(2)` by `as_chunks_mut::<2>()` in the
+two interleaved loops. The first comparison showed changes from −15 % to
++34 %, also for benchmarks whose code did **not** change (for example
+the split-half loop, +32 %, and "embed only", +7 %). We then compared the
+generated assembly of `rotate_tokens_with_table` for both versions
+(`cargo rustc --release --lib -- --emit asm`). The two versions differ by
+**one** reordered store instruction. LLVM had already proved that the
+slices have length 2 and removed the bounds checks.
+
+**Lesson.** The noise **between** runs (up to ±30 % for the 16 MiB
+`layouts` tensor) was much larger than Criterion's confidence interval
+**within** a run (±1–3 %). A confidence interval describes one run. It
+does not describe the state of the laptop (clock speed, temperature,
+background programs, memory placement). Thus: repeat runs, interleave the
+variants (A/B/A/B), and look at the machine code when a result is
+surprising.
+
+### 8.3 The table and the threads
+
+Default build, median of 3 runs, nanoseconds per rotated pair:
+
+| Workload `[B, S, H, D]` | Size | Direct | Table | Table + 16 threads |
+|---|---|---|---|---|
+| Decode step at `m = 4095` `[1, 1, 32, 128]` | 32 KiB | 10.06 | **0.609** (16.5×) | 0.616 (1 token → 1 thread) |
+| Short prompt `[1, 128, 8, 64]` | 512 KiB | 8.07 | **0.673** (12.0×) | 17.9 |
+| Batch `[2, 512, 16, 64]` | 8 MiB | 8.71 | **0.733** (11.9×) | 1.18 |
+| Prefill `[1, 2048, 32, 128]` | 64 MiB | 9.33 | 1.84 (5.1×) | **1.12** (8.3×) |
+| q + k, grouped-query `[1, 512, 32/8, 128]` | 20 MiB | 8.45 (copying: 11.1) | **1.60** | — |
+
+**Interpretation.**
+
+- When the tensor fits in a cache (32 KiB to 8 MiB), the table path costs
+  0.6–0.7 ns per pair: about 2–3 processor cycles (3.2–4.7 GHz) for 8
+  floating-point operations. This is the compute speed.
+- When the tensor is 64 MiB (larger than the 16 MiB L3 cache), the cost
+  rises to 1.84 ns per pair. Each pair moves 32 bytes, so one thread
+  reaches `32 B / 1.84 ns ≈ 17 GB/s`. The processor waits for memory.
+- 16 threads reach 1.12 ns per pair `≈ 28 GB/s`, about 37 % of the
+  theoretical 76.8 GB/s. Thread scaling (one run): 1 thread 7.78 ms,
+  2 threads 9.37 ms, 4 threads 5.73 ms, 8 threads 4.51 ms, 16 threads
+  4.52 ms. From 8 to 16 threads there is no gain: the memory bus is
+  full (section 3.3). **Unexplained:** 2 threads were slower than 1
+  thread. We did not investigate this; a possible reason is the
+  placement of the two threads by the Windows scheduler.
+- For the short prompt, 16 threads are 27 times slower than 1 thread.
+  The work (22 µs) is smaller than the cost to start and join 16 threads
+  (about 35 µs per thread on this system). This is Amdahl's law with a
+  large serial part (section 3.4).
+
+### 8.4 The position changes the cost of `sin_cos`
+
+This result corrects an assumption of the first Stage 9 plan. We said:
+"RoPE speed does not depend on the data". This is true for the **vector
+values**. It is **not** true for the **positions**. Decode step
+`[1, 1, 32, 128]`, direct rotation, 3 runs each:
+
+| Position `m` | Direct (median) | Table (median) |
+|---|---|---|
+| 0 | 8.95 µs | 1.27 µs |
+| 1 | 10.31 µs | 1.28 µs |
+| 4095 | 20.39 µs | 1.24 µs |
+| 1 000 000 | 21.40 µs | 1.25 µs |
+
+**Why.** At `m = 0` every angle is 0, and `sin_cos(0)` is a fast path.
+At small angles (`m = 1`, all `|φ| ≤ 1`) the range reduction is short. At
+`m = 4095`, the angles of the fast pairs are thousands of radians: the
+function must first compute `φ mod π/2` with extra precision. The table
+path does no trigonometry, so its cost does not depend on `m`. The first
+version of the benchmark measured the decode step at `m = 0`. That was
+unrealistic and made the direct path look 2.3 times too fast. The
+corrected benchmark uses `m = 4095`.
+
+### 8.5 Build settings: interleaved A/B/C/A/B/C
+
+A = default, B = `RUSTFLAGS="-C target-cpu=native"`, C = B plus
+`lto = "fat"` and `codegen-units = 1`. Each variant ran twice, in the
+order A1 B1 C1 A2 B2 C2, so that a slow drift of the laptop affects all
+variants equally. Medians in ns per pair:
+
+| Benchmark | A (default) | B (native) | C (native + LTO) |
+|---|---|---|---|
+| table, split-half, `d = 64` of 128 | 4.63 | **1.78** | 1.80 |
+| table, interleaved, `d = 64` of 128 | 5.29 | **3.01** | 2.89 |
+| table, split-half, `d = 128` | 1.74 | 1.65 | 1.50 |
+| prefill, table | 1.84 | 1.87 | 1.75 |
+| prefill, direct | 9.33 | 9.26 | 9.18 |
+| Shakespeare, embed + table | 3.53 | 3.80 | 3.79 |
+
+**Machine code.** The default target is the x86-64 baseline (SSE2 only).
+The hot function uses 12 `mulpd` (2 lanes) and 12 `mulsd` (1 lane), and
+no `ymm` register. With `target-cpu=native`, the same function uses 40
+`ymm` (256-bit AVX2) references and `vmulpd` (4 lanes). It contains
+**0** `vfmadd` instructions, although the processor supports FMA: Rust
+does not contract `a·b + c`. Therefore all tests also pass bit-identical
+with `target-cpu=native` (verified with `cargo test --release`).
+
+**Interpretation.** Only the compute-bound, cache-resident loops
+improved, and the split-half loop most: it reads `first[j]`, `second[j]`,
+`sin[j]`, `cos[j]` contiguously, which is the ideal form for 4-lane
+vectors. The interleaved loop must separate even and odd values first
+(`vunpck`/`vperm` shuffles). The memory-bound cases did not change. LTO
+gave no consistent difference: the hot functions are already in one
+crate, and each call does thousands of rotations, so the call overhead
+that LTO could remove is negligible.
+
+**Unexplained.** With the default build, partial rotation (`d = 64` of
+`D = 128`) took **longer** in total than full rotation on the table path
+(2.4–2.8 ms against 1.8 ms), although it does half of the arithmetic. The
+native build removes most of this difference. We did not find the cause;
+the loop for 32 pairs may be compiled with a different unrolling than the
+loop for 64 pairs. This is a good topic for a later profiling session.
+
+### 8.6 End-to-end on Tiny Shakespeare
+
+Pipeline: text (1 115 394 bytes) → character tokens (vocabulary 65) →
+embedding lookup into `q` and `k` `[64, 256, 6, 64]` (nanoGPT
+"shakespeare_char" geometry: 6 heads × 64 = 384) → RoPE on `q` and `k`.
+
+| Pipeline | Time | of which RoPE |
+|---|---|---|
+| embed only | 9.65 ms | — |
+| embed + RoPE direct | 64.8 ms | ≈ 55 ms |
+| embed + RoPE table | 22.2 ms | ≈ 12.5 ms |
+| embed + RoPE table + 16 threads | 17.7 ms | ≈ 8 ms |
+
+The embedding lookup is a pure memory copy, so it is a useful reference
+for the memory cost. We have no trained `W_q`, `W_k` weights; the
+embedding table plays the role of `x·W_q`. A real projection would cost
+`2 · 384 · 384` FLOPs per token, much more than RoPE: in a real model,
+RoPE with a table is a small part of the attention layer.
+
+### 8.7 Complexity and memory
+
+| Operation | Time | Extra memory |
+|---|---|---|
+| `sin_cos_table` | `O(L · d/2)` `sin_cos` calls (≈ 12 ns each, measured) | `2 · L · d/2 · 8` bytes |
+| `rotate_tensor_with_table` | `O(B · S · H · d/2)`, no trigonometry | none |
+| `rotate_tensor_parallel` | same work, divided over `n` threads, plus `n` thread starts | `n` thread stacks (operating system) |
+
+### 8.8 Possible next optimizations (not implemented)
+
+1. **`f32` storage:** halves the 32 bytes per pair. For memory-bound
+   sizes, this gives up to 2× speed.
+2. **A persistent thread pool:** removes the start-up cost, so that
+   threads also help medium sizes.
+3. **Fusing RoPE into the projection** that produces `q` and `k`: the
+   tensor would be rotated while it is still in the cache, which removes
+   one full read and write of `q` and `k`.
+4. **A faster table build:** the build loop uses `push`; a fill with
+   `extend` or by rows would let the compiler vectorize better. It is
+   built one time, so this has low priority.
+
+## 9. Practical example
+
+```bash
+cargo run --release --example cached_rope
+```
+
+Output (one run on the reference computer; the times vary):
+
+```text
+table: 16384 positions × 64 pairs = 16.0 MiB, built in 15.28 ms
+q + k rotation: direct 14.387 ms, with table 5.074 ms (one run, not a benchmark)
+results are bit-identical: yes
+```
+
+The example uses YaRN scaling and the split-half layout, rotates a
+32-head query and an 8-head key for the tokens 1000..1512, and compares
+the two paths with `assert_eq!`. One run is not a benchmark: the first
+run also includes cold caches and page faults. Use Criterion for real
+numbers.
+
+## 10. Test results and what we learned
+
+**Test results** (`cargo test`, 2026-11-02): 173 unit tests, 67 API tests
+(9 new), 47 numerical tests (4 new), 5 allocation tests (new) and 31
+documentation tests: **323 passed, 0 failed**. `cargo clippy
+--all-targets`: 0 warnings (after we fixed 10 existing warnings of the
+newer clippy lints `chunks_exact_to_as_chunks` and `manual_is_multiple_of`,
+and 1 warning in the new benchmark).
+`cargo test --release` with `-C target-cpu=native`: all pass.
+
+**Side fix.** The message of `RopeError::QueryKeyShapeMismatch`
+contained a run of spaces in the middle of the text (a missing `\` line
+continuation in the format string). Stage 9 fixed it.
+
+**Mathematics.**
+
+- A tensor has `B·S·H·d/2` pairs but only `S·d/2` different angles; a
+  table removes a factor `B·H` of the trigonometry.
+- The cost of `sin`/`cos` depends on the size of the angle (range
+  reduction); `sin_cos(0)` is a fast path.
+- Arithmetic intensity (FLOPs per byte) and the roofline model predict
+  when a loop is memory-bound; measured: 0.25 FLOP/byte, 28 GB/s with
+  16 threads.
+- Amdahl's law with a serial start-up cost explains why threads slow
+  down small inputs.
+- IEEE 754 operations in the same order give the same bits; no FMA
+  contraction means the optimizations are exact.
+- Bootstrap confidence intervals describe one run, not the variation
+  between runs.
+
+**Rust.**
+
+- Criterion, `harness = false`, `black_box`, baselines.
+- Structure of arrays and borrowed row slices.
+- `as_chunks_mut::<N>()` and const generics; the optimizer can already
+  remove bounds checks, so measure before you change code for speed.
+- `NonZeroUsize` and the niche optimization.
+- `std::thread::scope`, `chunks_mut` for disjoint mutable blocks, `Send`
+  and `Sync`.
+- `#[global_allocator]`, `unsafe impl GlobalAlloc`, thread-local
+  counters, and a written safety argument.
+- `--emit asm` to read the machine code; `RUSTFLAGS="-C
+  target-cpu=native"`; `CARGO_PROFILE_BENCH_LTO`.
+
+---
+
+## Roadmap status after Entry 17
+
+| Stage | Status |
+|---|---|
+| 1 Project foundation | ✅ Done (Entry 1) |
+| 2 Mathematical foundations | ✅ Done (Entries 2–6) |
+| 3 Frequencies, positions, angles | ✅ Done (Entries 7–9) |
+| 4 RoPE transformation of a vector | ✅ Done (Entry 10) |
+| 5 Query and key tensors | ✅ Done (Entries 11–12) |
+| 6 PyTorch reference validation | ✅ Done (Entry 13) |
+| 7 Layouts and partial RoPE | ✅ Done (Entries 14–15) |
+| 8 RoPE scaling | ✅ Done (Entry 16) |
+| 9 CPU performance engineering | ✅ Done (Entry 17) |
+| Next (not planned yet) | ⏳ `f32` tensors, a thread pool, explicit SIMD, dynamic NTK |

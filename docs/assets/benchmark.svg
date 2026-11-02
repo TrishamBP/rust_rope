@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="450" viewBox="0 0 900 450" role="img" aria-labelledby="ct cd">
+<title id="ct">RoPE on the CPU: time per rotated pair</title>
+<desc id="cd">Nanoseconds per rotated pair, lower is better. Decode step at m = 4095 [1, 1, 32, 128]: direct (sin_cos per pair) 10.1 ns, SinCosTable 0.61 ns, SinCosTable + 16 threads 0.62 ns; Short prompt [1, 128, 8, 64]: direct (sin_cos per pair) 8.07 ns, SinCosTable 0.67 ns, SinCosTable + 16 threads 17.9 ns; Batch, fits in L3 [2, 512, 16, 64]: direct (sin_cos per pair) 8.71 ns, SinCosTable 0.73 ns, SinCosTable + 16 threads 1.18 ns; LLaMA-like prefill [1, 2048, 32, 128]: direct (sin_cos per pair) 9.33 ns, SinCosTable 1.84 ns, SinCosTable + 16 threads 1.12 ns.</desc>
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#8a8984; --grid:#e4e3df;
+         --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#8f8e86; --grid:#2f2f2d;
+           --s1:#3987e5; --s2:#d95926; --s3:#199e70; }
+  }
+  .bg { fill: var(--surface); }
+  .t1 { font: 600 18px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: var(--ink); }
+  .t2 { font: 13px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: var(--ink2); }
+  .lab { font: 600 13px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: var(--ink); }
+  .sub { font: 12px 'JetBrains Mono',Consolas,'DejaVu Sans Mono',monospace; fill: var(--ink2); }
+  .val { font: 12px 'JetBrains Mono',Consolas,'DejaVu Sans Mono',monospace; fill: var(--ink); }
+  .tick { font: 11px 'Segoe UI','Helvetica Neue',Arial,sans-serif; fill: var(--muted); }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .base { stroke: var(--muted); stroke-width: 1; }
+  .s0 { fill: var(--s1); } .s1 { fill: var(--s2); } .s2 { fill: var(--s3); }
+</style>
+<g class="viz">
+<rect class="bg" width="900" height="450" rx="16"/>
+<text x="24" y="36" class="t1">RoPE on the CPU: time per rotated pair</text>
+<text x="24" y="58" class="t2">AMD Ryzen 7 6800H · f64 · interleaved · default release build · median of 3 Criterion runs</text>
+<rect x="230" y="78" width="12" height="12" rx="3" class="s0"/>
+<text x="248" y="89" class="t2">direct (sin_cos per pair)</text>
+<rect x="476" y="78" width="12" height="12" rx="3" class="s1"/>
+<text x="494" y="89" class="t2">SinCosTable</text>
+<rect x="610" y="78" width="12" height="12" rx="3" class="s2"/>
+<text x="628" y="89" class="t2">SinCosTable + 16 threads</text>
+<line x1="230.0" y1="110" x2="230.0" y2="388" class="grid"/>
+<text x="230.0" y="404" text-anchor="middle" class="tick">0</text>
+<line x1="375.0" y1="110" x2="375.0" y2="388" class="grid"/>
+<text x="375.0" y="404" text-anchor="middle" class="tick">5</text>
+<line x1="520.0" y1="110" x2="520.0" y2="388" class="grid"/>
+<text x="520.0" y="404" text-anchor="middle" class="tick">10</text>
+<line x1="665.0" y1="110" x2="665.0" y2="388" class="grid"/>
+<text x="665.0" y="404" text-anchor="middle" class="tick">15</text>
+<line x1="810.0" y1="110" x2="810.0" y2="388" class="grid"/>
+<text x="810.0" y="404" text-anchor="middle" class="tick">20</text>
+<text x="520" y="422" text-anchor="middle" class="t2">nanoseconds per rotated pair (lower is better)</text>
+<line x1="230" y1="110" x2="230" y2="388" class="base"/>
+<text x="216" y="138" text-anchor="end" class="lab">Decode step at m = 4095</text>
+<text x="216" y="154" text-anchor="end" class="sub">[1, 1, 32, 128]</text>
+<path d="M230,118 h287.74 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-287.74 z" class="s0"><title>Decode step at m = 4095 [1, 1, 32, 128] — direct (sin_cos per pair): 10.1 ns per pair</title></path>
+<text x="527.7" y="129" class="val">10.1</text>
+<path d="M230,134 h13.66 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-13.66 z" class="s1"><title>Decode step at m = 4095 [1, 1, 32, 128] — SinCosTable: 0.61 ns per pair</title></path>
+<text x="253.7" y="145" class="val">0.61</text>
+<path d="M230,150 h13.86 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-13.86 z" class="s2"><title>Decode step at m = 4095 [1, 1, 32, 128] — SinCosTable + 16 threads: 0.62 ns per pair</title></path>
+<text x="253.9" y="161" class="val">0.62</text>
+<text x="216" y="210" text-anchor="end" class="lab">Short prompt</text>
+<text x="216" y="226" text-anchor="end" class="sub">[1, 128, 8, 64]</text>
+<path d="M230,190 h230.03 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-230.03 z" class="s0"><title>Short prompt [1, 128, 8, 64] — direct (sin_cos per pair): 8.07 ns per pair</title></path>
+<text x="470.0" y="201" class="val">8.07</text>
+<path d="M230,206 h15.52 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-15.52 z" class="s1"><title>Short prompt [1, 128, 8, 64] — SinCosTable: 0.67 ns per pair</title></path>
+<text x="255.5" y="217" class="val">0.67</text>
+<path d="M230,222 h515.91 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-515.91 z" class="s2"><title>Short prompt [1, 128, 8, 64] — SinCosTable + 16 threads: 17.9 ns per pair</title></path>
+<text x="755.9" y="233" class="val">17.9</text>
+<text x="216" y="282" text-anchor="end" class="lab">Batch, fits in L3</text>
+<text x="216" y="298" text-anchor="end" class="sub">[2, 512, 16, 64]</text>
+<path d="M230,262 h248.59 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-248.59 z" class="s0"><title>Batch, fits in L3 [2, 512, 16, 64] — direct (sin_cos per pair): 8.71 ns per pair</title></path>
+<text x="488.6" y="273" class="val">8.71</text>
+<path d="M230,278 h17.26 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-17.26 z" class="s1"><title>Batch, fits in L3 [2, 512, 16, 64] — SinCosTable: 0.73 ns per pair</title></path>
+<text x="257.3" y="289" class="val">0.73</text>
+<path d="M230,294 h30.16 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-30.16 z" class="s2"><title>Batch, fits in L3 [2, 512, 16, 64] — SinCosTable + 16 threads: 1.18 ns per pair</title></path>
+<text x="270.2" y="305" class="val">1.18</text>
+<text x="216" y="354" text-anchor="end" class="lab">LLaMA-like prefill</text>
+<text x="216" y="370" text-anchor="end" class="sub">[1, 2048, 32, 128]</text>
+<path d="M230,334 h266.63 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-266.63 z" class="s0"><title>LLaMA-like prefill [1, 2048, 32, 128] — direct (sin_cos per pair): 9.33 ns per pair</title></path>
+<text x="506.6" y="345" class="val">9.33</text>
+<path d="M230,350 h49.33 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-49.33 z" class="s1"><title>LLaMA-like prefill [1, 2048, 32, 128] — SinCosTable: 1.84 ns per pair</title></path>
+<text x="289.3" y="361" class="val">1.84</text>
+<path d="M230,366 h28.57 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-28.57 z" class="s2"><title>LLaMA-like prefill [1, 2048, 32, 128] — SinCosTable + 16 threads: 1.12 ns per pair</title></path>
+<text x="268.6" y="377" class="val">1.12</text>
+<text x="24" y="436" class="tick">Decode step: 1 token, so the parallel function uses 1 thread. Short prompt: starting 16 threads costs more than the work.</text>
+</g></svg>

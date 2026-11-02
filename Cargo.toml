@@ -9,14 +9,25 @@ publish = false
 # Binary crate:  src/main.rs (detected automatically).
 
 [dependencies]
-# Intentionally empty. Stage 1 uses only the Rust standard library.
+# Intentionally empty. The library uses only the Rust standard library.
 # Rule: every new dependency must be explained in explain.md first.
 
 [dev-dependencies]
-# Intentionally empty. A benchmark framework may be added in Stage 6.
+# Stage 9 (explain.md, Entry 17): the statistical benchmark framework.
+# Development only: it is not compiled into the library or the binary.
+# `default-features = false` removes the plotting (plotters) and the
+# parallel analysis (rayon) features. This keeps the dependency tree small.
+# `cargo_bench_support` keeps the normal `cargo bench` command line.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
+# Stage 5 simple benchmark (std::time only). Kept for comparison.
 [[bench]]
 name = "rope_benchmark"
 # `harness = false` tells Cargo not to use the built-in (nightly-only) test
 # harness for this benchmark. The file supplies its own `main` function.
+harness = false
+
+# Stage 9 statistical benchmark (Criterion).
+[[bench]]
+name = "rope_criterion"
 harness = false

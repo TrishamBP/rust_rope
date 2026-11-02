@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="200" viewBox="0 0 640 200" role="img" aria-labelledby="title desc">
+  <title id="title">rust_rope logo</title>
+  <desc id="desc">A gear-shaped ring around a unit circle. A vector rotates inside the circle by the angle m times theta. The text reads rust_rope, Rotary Position Embeddings from scratch in Rust.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1f27"/>
+      <stop offset="1" stop-color="#2a1d18"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f4a261"/>
+      <stop offset="1" stop-color="#ce422b"/>
+    </linearGradient>
+    <marker id="head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f4a261"/>
+    </marker>
+    <marker id="head2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8ecae6"/>
+    </marker>
+  </defs>
+
+  <rect width="640" height="200" rx="24" fill="url(#bg)"/>
+
+  <!-- Gear ring: 16 teeth around a circle (a nod to the Rust gear). -->
+  <g transform="translate(100 100)">
+    <g fill="url(#rust)">
+      <circle r="70"/>
+      <g id="tooth"><rect x="-7" y="-82" width="14" height="16" rx="3"/></g>
+      <use href="#tooth" transform="rotate(22.5)"/>
+      <use href="#tooth" transform="rotate(45)"/>
+      <use href="#tooth" transform="rotate(67.5)"/>
+      <use href="#tooth" transform="rotate(90)"/>
+      <use href="#tooth" transform="rotate(112.5)"/>
+      <use href="#tooth" transform="rotate(135)"/>
+      <use href="#tooth" transform="rotate(157.5)"/>
+      <use href="#tooth" transform="rotate(180)"/>
+      <use href="#tooth" transform="rotate(202.5)"/>
+      <use href="#tooth" transform="rotate(225)"/>
+      <use href="#tooth" transform="rotate(247.5)"/>
+      <use href="#tooth" transform="rotate(270)"/>
+      <use href="#tooth" transform="rotate(292.5)"/>
+      <use href="#tooth" transform="rotate(315)"/>
+      <use href="#tooth" transform="rotate(337.5)"/>
+      <animateTransform attributeName="transform" type="rotate" from="0" to="22.5" dur="6s" repeatCount="indefinite"/>
+    </g>
+    <circle r="58" fill="#1b1f27"/>
+    <!-- Axes and unit circle. -->
+    <line x1="-50" y1="0" x2="50" y2="0" stroke="#3d4452" stroke-width="1.5"/>
+    <line x1="0" y1="-50" x2="0" y2="50" stroke="#3d4452" stroke-width="1.5"/>
+    <circle r="42" fill="none" stroke="#5c6475" stroke-width="1.5" stroke-dasharray="3 4"/>
+    <!-- The original vector x (fixed) and the rotated vector R(mθ)x. -->
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#8ecae6" stroke-width="3.5" stroke-linecap="round" marker-end="url(#head2)"/>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#f4a261" stroke-width="3.5" stroke-linecap="round" marker-end="url(#head)">
+      <animateTransform attributeName="transform" type="rotate" values="0;-300;-360" keyTimes="0;0.83;1" dur="6s" repeatCount="indefinite"/>
+    </line>
+    <circle r="4" fill="#e9ecef"/>
+  </g>
+
+  <!-- Word mark. -->
+  <text x="205" y="98" font-family="'JetBrains Mono','Fira Code',Consolas,'DejaVu Sans Mono',monospace" font-size="56" font-weight="700" fill="#e9ecef">rust<tspan fill="#f4a261">_</tspan>rope</text>
+  <text x="208" y="134" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="19" fill="#adb5bd">Rotary Position Embeddings, from scratch in Rust</text>
+  <text x="208" y="162" font-family="'JetBrains Mono',Consolas,'DejaVu Sans Mono',monospace" font-size="15" fill="#8ecae6">x′ = R(m·θⱼ) · x</text>
+  <text x="400" y="162" font-family="'JetBrains Mono',Consolas,'DejaVu Sans Mono',monospace" font-size="15" fill="#8ecae6">θⱼ = b^(−2j/d)</text>
+</svg>

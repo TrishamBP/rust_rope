@@ -3,9 +3,10 @@
 This document describes the structure of `rust_rope`.
 It explains what each part does, and why the parts are separate.
 
-> **Status:** Stage 8 is complete. All modules are implemented. Sections
+> **Status:** Stage 9 is complete. All modules are implemented. Sections
 > 1–7 describe the state after Stage 3 (kept for the learning history);
-> sections 8–12 describe the current state.
+> sections 8–13 describe the current state. Section 13 describes the
+> Stage 9 performance additions.
 
 ---
 
@@ -247,6 +248,8 @@ Other targets:
 | Example | `examples/basic_rope.rs` | Entry 10 worked example (Stage 4) |
 | Example | `examples/export_reference_cases.rs` | Writes the 288 reference cases (Stages 6–8) |
 | Benchmark | `benches/rope_benchmark.rs` | Simple `std::time` benchmark (Stages 5, 7) |
+| Benchmark | `benches/rope_criterion.rs` | Criterion benchmark suite, 6 groups (Stage 9) |
+| Integration tests | `tests/allocation_tests.rs` | Counts heap allocations with a custom global allocator (Stage 9) |
 | Validation tooling | `reference/*.py` | Independent PyTorch reference (not production code) |
 
 ## 9. Implementation flow (Stages 4–8)
@@ -308,6 +311,42 @@ it.
 
 ## 12. Planned (not implemented)
 
-- Stage 9: CPU performance engineering (Criterion benchmarks, `cos`/`sin`
-  caches, SIMD, Rayon). Waiting for approval.
+- ~~Stage 9: CPU performance engineering.~~ Implemented (2026-11-02), see
+  section 13. Not implemented in Stage 9: explicit SIMD, `f32` tensors,
+  a thread pool.
 - Attention itself (softmax, masking), KV cache, GPU: outside the scope.
+
+## 13. Performance architecture (Stage 9)
+
+```text
+RotaryEmbedding
+   └── sin_cos_table(PositionRange)?  → SinCosTable      frequencies.rs
+                                         sin: Vec<f64>  [L × d/2], row-major
+                                         cos: Vec<f64>  [L × d/2], row-major
+        │  (build ONE time, for example for the full context length)
+        ▼
+rotate_tensor_with_table(&mut q, &table, start)?      embeddings.rs
+rotate_query_key_with_table(&mut q, &mut k, &table, start)?
+rotate_tensor_parallel(&mut q, &table, start, NonZeroUsize)?
+        │ check D, table pairs = d/2, start..start+S ⊆ table positions
+        ▼
+rotate_tokens_with_table(block, first_token, …)       ← shared by serial and parallel
+    for token t: s = t mod S → (sin row, cos row) = table.rows_at(first_row + s)
+        for head h: rotate_pairs_with_table(head, sin, cos)
+            Interleaved: as_chunks_mut::<2>() zip sin zip cos
+            SplitHalf:   split_at_mut(d/2) zip sin zip cos
+            rotate_pair_sin_cos → math::matrix::rotate_vector_sin_cos
+                                  → Matrix2::rotation_from_sin_cos (also used by Matrix2::rotation)
+```
+
+- **Layering is unchanged.** The new math primitive
+  (`rotate_vector_sin_cos`) is general and lives in `math`. The table is
+  RoPE-specific (positions × pairs) and lives in `rope::frequencies`,
+  next to `AngleTable`.
+- **One formula.** `Matrix2::rotation(θ)` now calls
+  `Matrix2::rotation_from_sin_cos`. The direct and the table paths
+  therefore execute the same arithmetic: the results are bit-identical.
+- **Parallelism** uses `std::thread::scope` and `chunks_mut`: disjoint
+  mutable blocks, no locks, no `unsafe`, no new library dependency.
+- **The library has no dependencies.** Criterion is a `[dev-dependency]`
+  for `benches/rope_criterion.rs` only.

@@ -6,12 +6,12 @@
 fn main() {
     // `env!` reads a value at compile time. Cargo sets these variables.
     println!(
-        "{} v{} — Stage 8: RoPE with layouts, partial rotation and scaling complete.",
+        "{} v{} — Stage 9: RoPE with layouts, partial rotation, scaling and CPU optimizations.",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
     println!(
-        "Stage 9 (CPU performance engineering) is planned. See README.md and ROPE_Engineering.pdf."
+        "Run `cargo bench --bench rope_criterion` for the Stage 9 benchmarks (see README.md)."
     );
     println!("Run `cargo run --example basic_rope` to see the Stage 4 worked example.");
     println!("Run `cargo run --example math_foundations` to see the Stage 2 mathematics.");
